@@ -175,6 +175,41 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Wasm {
+                name,
+                path,
+                max_execution_time_ms,
+                max_memory_bytes,
+            } => {
+                if name.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "name".to_string(),
+                        value: name.to_string(),
+                        reason: "Must be non-empty".to_string(),
+                    });
+                }
+                if path.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "path".to_string(),
+                        value: path.to_string(),
+                        reason: "Must be non-empty".to_string(),
+                    });
+                }
+                if *max_memory_bytes == 0 || *max_memory_bytes > 1024 * 1024 * 1024 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_memory_bytes".to_string(),
+                        value: max_memory_bytes.to_string(),
+                        reason: "Must be != 0 and <= 1GB".to_string(),
+                    });
+                }
+                if *max_execution_time_ms == 0 || *max_execution_time_ms > 1000 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_execution_time_ms".to_string(),
+                        value: max_execution_time_ms.to_string(),
+                        reason: "Must be != 0 and <= 1000".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -647,6 +682,28 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_wasm_policy_invalid() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Wasm {
+                name: "test".to_string(),
+                path: "test.wasm".to_string(),
+                max_execution_time_ms: 0,
+                max_memory_bytes: 0,
+            },
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("Must be != 0 and <= 1000"));
+            assert!(e.to_string().contains("Must be != 0 and <= 1GB"));
+        }
     }
 
     #[test]

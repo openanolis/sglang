@@ -262,6 +262,18 @@ pub enum PolicyConfig {
         /// Interval for load monitoring (seconds)
         load_check_interval_secs: u64,
     },
+
+    #[serde(rename = "wasm")]
+    Wasm {
+        /// Policy name
+        name: String,
+        /// Policy module path
+        path: String,
+        /// Maximum execution time in milliseconds, default 100ms
+        max_execution_time_ms: u64,
+        /// Maximum memory usage in bytes, default 1MB
+        max_memory_bytes: usize,
+    },
 }
 
 impl PolicyConfig {
@@ -271,6 +283,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::Wasm { .. } => "wasm",
         }
     }
 }
@@ -681,6 +694,14 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+
+        let wasm = PolicyConfig::Wasm {
+            name: "test".to_string(),
+            path: "test.wasm".to_string(),
+            max_execution_time_ms: 100,
+            max_memory_bytes: 1024,
+        };
+        assert_eq!(wasm.name(), "wasm");
     }
 
     #[test]
@@ -710,6 +731,20 @@ mod tests {
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
         assert!(json.contains("\"load_check_interval_secs\":60"));
+
+        // Test Wasm
+        let wasm = PolicyConfig::Wasm {
+            name: "test".to_string(),
+            path: "test.wasm".to_string(),
+            max_execution_time_ms: 100,
+            max_memory_bytes: 1024,
+        };
+        let json = serde_json::to_string(&wasm).unwrap();
+        assert!(json.contains("\"type\":\"wasm\""));
+        assert!(json.contains("\"name\":\"test\""));
+        assert!(json.contains("\"path\":\"test.wasm\""));
+        assert!(json.contains("\"max_execution_time_ms\":100"));
+        assert!(json.contains("\"max_memory_bytes\":1024"));
     }
 
     #[test]
@@ -753,6 +788,31 @@ mod tests {
                 assert_eq!(load_check_interval_secs, 120);
             }
             _ => panic!("Expected PowerOfTwo"),
+        }
+    }
+
+    #[test]
+    fn test_wasm_parameters() {
+        let wasm = PolicyConfig::Wasm {
+            name: "test".to_string(),
+            path: "test.wasm".to_string(),
+            max_execution_time_ms: 100,
+            max_memory_bytes: 1024,
+        };
+
+        match wasm {
+            PolicyConfig::Wasm {
+                name,
+                path,
+                max_execution_time_ms,
+                max_memory_bytes,
+            } => {
+                assert_eq!(name, "test");
+                assert_eq!(path, "test.wasm");
+                assert_eq!(max_execution_time_ms, 100);
+                assert_eq!(max_memory_bytes, 1024);
+            }
+            _ => panic!("Expected Wasm"),
         }
     }
 

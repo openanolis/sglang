@@ -241,7 +241,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let min_load = *loads.iter().min().unwrap_or(&0);
 
         // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+        let is_imbalanced: bool = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {

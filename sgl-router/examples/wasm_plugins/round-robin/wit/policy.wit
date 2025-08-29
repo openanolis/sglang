@@ -1,0 +1,56 @@
+package sgl-router:policy;
+
+interface worker {
+  url: func() -> string;
+  worker-type: func() -> worker-type;
+  is-healthy: func() -> bool;
+  load: func() -> u32;
+  metadata: func() -> worker-metadata;
+  is-available: func() -> bool;
+}
+
+interface policy {
+  enum worker-type {
+    regular,
+    prefill,
+    decode,
+  }
+
+  record worker-metadata {
+    url: string,
+    worker-type: worker-type,
+///    labels: map<string, string>,
+  }
+
+  record worker {
+    url: string,
+    worker-type: worker-type,
+    healthy: bool,
+    load: u32,
+    processed-requests: u32,
+    metadata: worker-metadata,
+    available: bool,
+  }
+
+  record loads-entry {
+    url: string,
+    load: u32
+  }
+
+  name: func() -> string;
+  needs-request-text: func() -> bool;
+  select-worker: func(workers: list<worker>, request-text: option<string>) -> option<u32>;
+  select-worker-pair: func(
+    prefill-workers: list<worker>,
+    decode-workers: list<worker>,
+    request-text: option<string>
+  ) -> option<tuple<u32, u32>>;
+  update-loads: func(loads: list<loads-entry>);
+  reset: func();
+  on-request-complete: func(worker-url: string, success: bool);
+}
+
+world policy-world {
+  import worker;
+  export policy;
+}

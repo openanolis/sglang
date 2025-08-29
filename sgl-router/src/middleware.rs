@@ -220,6 +220,8 @@ impl<B> OnRequest<B> for RequestLogger {
             target: "sglang_router_rs::request",
             "started processing request"
         );
+
+
     }
 }
 
