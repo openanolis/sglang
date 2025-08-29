@@ -11,12 +11,14 @@ mod factory;
 mod power_of_two;
 mod random;
 mod round_robin;
+mod wasm;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use wasm::{WasmConfig, WasmPolicy};
 
 /// Core trait for load balancing policies
 ///

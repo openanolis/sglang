@@ -2,7 +2,7 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    RoundRobinPolicy, WasmConfig, WasmPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -32,6 +32,20 @@ impl PolicyFactory {
                     max_tree_size: *max_tree_size,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
+            }
+            PolicyConfig::Wasm {
+                name,
+                path,
+                max_execution_time_ms,
+                max_memory_bytes
+            } => {
+                let config = WasmConfig {
+                    name: name.clone(),
+                    path: path.clone(),
+                    max_execution_time_ms: *max_execution_time_ms,
+                    max_memory_bytes: *max_memory_bytes,
+                };
+                Arc::new(WasmPolicy::with_config(config))
             }
         }
     }
