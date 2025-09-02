@@ -38,6 +38,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import print_warning_once
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -714,6 +715,7 @@ def runai_safetensors_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
+    start = time.time()
     with SafetensorsStreamer() as streamer:
         for st_file in tqdm(
             hf_weights_files,
@@ -723,6 +725,8 @@ def runai_safetensors_weights_iterator(
         ):
             streamer.stream_file(st_file)
             yield from streamer.get_tensors()
+    end = time.time()
+
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
