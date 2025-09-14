@@ -1631,6 +1631,18 @@ class RemoteModelLoader(BaseModelLoader):
         logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)
         return model.eval()
 
+class CheckpointEngineModelLoader(BaseModelLoader):
+    def __init__(self, load_config: LoadConfig):
+    def load_model(
+        self,
+        model_config: ModelConfig,
+        evice_config: DeviceConfig,
+    ) -> nn.Module:
+        logger.info("Loading weights from checkpoint engine ...")
+        load_config = self.load_config
+
+        model_weights = model_config.model_path
+
 
 def load_model_with_cpu_quantization(
     self,

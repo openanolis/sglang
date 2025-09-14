@@ -145,6 +145,8 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+from checkpoint_engine.ps import ParameterServer, request_inference_to_update
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1145,6 +1147,52 @@ class ModelRunner:
         self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
+
+    def check_sglang_ready(endpoint: str, inference_parallel_size: int):
+        if rank != rank // inference_parallel_size * inference_parallel_size:
+            return
+        retry_num = 0
+        while True:
+            try:
+                response = requests.get(f"{endpoint}/health")
+                response.raise_for_status()
+                return
+            except requests.exceptions.RequestException as e:
+                retry_num += 1
+                logger.warning(f"fail to check sglang ready, retry {retry_num} times, error: {e}")
+                time.sleep(5)
+
+    def update_weights_from_checkpoint_engine(
+        ps: ParameterServer,
+        checkpoint_name: str,
+        checkpoint_files: list[str],
+        named_tensors: dict[str, torch.Tensor],
+        req_func: Callable[[list[tuple[str, str]]], None],
+        inference_parallel_size: int,
+        endpoint: str,
+        save_metas_file: str | None = None,
+        update_method: Literal["broadcast", "p2p", "all"] = "broadcast",
+    ):
+        ps.register_checkpoint(checkpoint_name, files=checkpoint_files, named_tensors=named_tensors)
+        ps.init_process_group()
+        check_sglang_ready(endpoint, inference_parallel_size)
+        dist.barrier()
+        with timer("Gather metas"):
+            ps.gather_metas(checkpoint_name)
+        if save_metas_file and int(os.getenv("RANK")) == 0:
+            with open(save_metas_file, "wb") as f:
+                pickle.dump(ps.get_metas(), f)
+
+        if update_method == "broadcast" or update_method == "all":
+            with timer("Update weights without setting ranks"):
+                ps.update(checkpoint_name, req_func)
+
+        if update_method == "p2p" or update_method == "all":
+            if update_method:
+                # sleep 2s to wait destroy process group
+                time.sleep(2)
+            with timer("Update weights with setting ranks"):
+                ps.update(checkpoint_name, req_func, ranks=list(range(inference_parallel_size)))
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100

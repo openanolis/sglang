@@ -91,6 +91,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightFromCheckpointEngineReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
@@ -683,6 +684,27 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
+@app.post("/update_weights_from_checkpoint_engine")
+async def update_weights_from_checkpoint_engine(
+    obj:UpdateWeightFromCheckpointEngineReqInput,
+    request: Request):
+    success = (
+        await _global_state.tokenizer_manager.update_weights_from_checkpoint_engine(obj, request)
+    )
+    content = {
+        "success": success,
+        "message": message,
+    }
+    if success:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 @app.post("/init_weights_send_group_for_remote_instance")
 async def init_weights_send_group_for_remote_instance(
