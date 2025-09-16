@@ -22,7 +22,9 @@ import os
 import socket
 import threading
 import time
+import pickle
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 from urllib.parse import urlparse
@@ -145,21 +147,8 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
-# Import ParameterServer and related functions for checkpoint engine
-try:
-    from checkpoint_engine.ps import ParameterServer
-    from sglang.srt.model_executor.update import (
-        split_checkpoint_files,
-        split_tensors,
-        update_weights,
-    )
-    CHECKPOINT_ENGINE_AVAILABLE = True
-except ImportError:
-    CHECKPOINT_ENGINE_AVAILABLE = False
-    ParameterServer = None
-    split_checkpoint_files = None
-    split_tensors = None
-    update_weights = None
+from safetensors import safe_open
+from checkpoint_engine.ps import ParameterServer, request_inference_to_update
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -1176,6 +1165,81 @@ class ModelRunner:
         self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
+
+    def check_sglang_ready(endpoint: str, inference_parallel_size: int):
+        if rank != rank // inference_parallel_size * inference_parallel_size:
+            return
+        retry_num = 0
+        while True:
+            try:
+                response = requests.get(f"{endpoint}/health")
+                response.raise_for_status()
+                return
+            except requests.exceptions.RequestException as e:
+                retry_num += 1
+                logger.warning(f"fail to check sglang ready, retry {retry_num} times, error: {e}")
+                time.sleep(5)
+    
+    def split_checkpoint_files(checkpoint_path: str, rank: int, world_size: int) -> list[str]:
+        checkpoint_files = [
+            os.path.join(checkpoint_path, f) for f in filter(lambda x: x.endswith(".safetensors"), os.listdir(checkpoint_path))
+        ]
+        files_per_rank = (len(checkpoint_files) + world_size - 1) // world_size
+        return checkpoint_files[rank * files_per_rank : (rank + 1) * files_per_rank]
+    
+    
+    def split_tensors(checkpoint_path: str, rank: int, world_size: int) -> dict[str, torch.Tensor]:
+        index_fn = os.path.join(checkpoint_path, "model.safetensors.index.json")
+        with open(index_fn, "r") as f:
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+        weights_per_rank = (len(weight_map) + world_size - 1) // world_size
+        fn_tensors: dict[str, list[str]] = defaultdict(list)
+        weight_keys = list(weight_map.items())
+        for name, file in weight_keys[rank * weights_per_rank : (rank + 1) * weights_per_rank]:
+            fn_tensors[file].append(name)
+        named_tensors = {}
+        for file, names in fn_tensors.items():
+            with safe_open(os.path.join(checkpoint_path, file), framework="pt") as f:
+                for name in names:
+                    named_tensors[name] = f.get_tensor(name)
+        return named_tensors
+    
+    
+    def req_inference(endpoint: str, inference_parallel_size: int):
+        rank = int(os.getenv("RANK", None))
+        src = rank // inference_parallel_size * inference_parallel_size
+    
+        def req_func(socket_paths: list[tuple[str, str]]):
+            if rank == src:
+                request_inference_to_update(
+                    f"{endpoint}/collective_rpc",
+                    dict(socket_paths[src : src + inference_parallel_size]),
+                )
+    
+        return req_func
+    
+    
+    def update_weights_from_ckpt_engine(
+        ps: ParameterServer,
+        checkpoint_name: str,
+        save_metas_file: str,
+        req_func: Callable[[list[tuple[str, str]]], None],
+        inference_parallel_size: int,
+        endpoint: str,
+    ):
+        assert save_metas_file, "save_metas_file is required"
+        with open(save_metas_file, "rb") as f:
+            metas = pickle.load(f)
+        ps.init_process_group()
+        self.check_sglang_ready(endpoint, inference_parallel_size)
+        dist.barrier()
+        with timer("Gather metas before join"):
+            ps.gather_metas(checkpoint_name)
+        ps.load_metas(metas)
+        with timer(
+            f"Update weights with setting ranks as range(0, {inference_parallel_size}) by using p2p"
+        ):
+            ps.update(checkpoint_name, req_func, ranks=list(range(inference_parallel_size)))
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
@@ -2249,11 +2313,11 @@ class ModelRunner:
         index_fn = os.path.join(checkpoint_path, "model.safetensors.index.json")
         if os.path.exists(index_fn):
             # Use tensor splitting approach
-            named_tensors = split_tensors(checkpoint_path, rank, world_size)
+            named_tensors = self.split_tensors(checkpoint_path, rank, world_size)
             checkpoint_files = []
         else:
             # Use file splitting approach
-            checkpoint_files = split_checkpoint_files(checkpoint_path, rank, world_size)
+            checkpoint_files = self.split_checkpoint_files(checkpoint_path, rank, world_size)
             named_tensors = {}
         
         # Create request function for inference
@@ -2266,7 +2330,7 @@ class ModelRunner:
         try:
             # Use the configured checkpoint engine endpoint or default
             endpoint = self.server_args.ckpt_engine_endpoint or "http://localhost:19730"
-            update_weights(
+            self.update_weights_from_ckpt_engine(
                 ps=self.ps,
                 checkpoint_name=checkpoint_name,
                 checkpoint_files=checkpoint_files,
