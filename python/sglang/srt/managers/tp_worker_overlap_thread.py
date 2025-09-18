@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromCkptEngineReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -291,6 +292,10 @@ class TpModelWorkerClient:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.worker.update_weights_from_tensor(recv_req)
+        return success, message
+
+    def update_weights_from_ckpt_engine(self, recv_req: UpdateWeightsFromCkptEngineReqInput):
+        success, message = self.worker.update_weights_from_ckpt_engine(recv_req)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
