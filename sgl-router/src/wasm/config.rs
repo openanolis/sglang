@@ -2,7 +2,7 @@
 //!
 //! 提供 WASM 模块的配置管理功能，包括配置验证、默认值设置和配置合并。
 
-use crate::wasm::errors::{WasmError, ErrorSeverity};
+use crate::wasm::errors::WasmError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -341,10 +341,10 @@ impl WasmConfig {
     /// 从文件加载配置
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: WasmConfig = toml::from_str(&content)
+        let config: WasmConfig = serde_json::from_str(&content)
             .map_err(|e| WasmError::config_error(
                 format!("无法解析配置文件: {}", e),
-                Some("toml_parse".to_string())
+                Some("json_parse".to_string())
             ))?;
         
         config.validate()?;
@@ -353,10 +353,10 @@ impl WasmConfig {
 
     /// 保存配置到文件
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = toml::to_string_pretty(self)
+        let content = serde_json::to_string_pretty(self)
             .map_err(|e| WasmError::serialization_error(
                 format!("无法序列化配置: {}", e),
-                Some("toml_serialize".to_string()),
+                Some("json_serialize".to_string()),
                 Some(Box::new(e))
             ))?;
         

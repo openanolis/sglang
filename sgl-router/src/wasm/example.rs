@@ -5,7 +5,7 @@
 //! and performance monitoring.
 
 use anyhow::Result;
-use sgl_router::wasm::wasm_manager::*;
+use crate::wasm::wasm_manager::*;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -101,20 +101,19 @@ pub async fn basic_usage_example() -> Result<()> {
         },
     };
 
-    // Create a dummy WASM bytecode for demonstration
+    // Create a temporary WASM file for demonstration
+    let temp_dir = std::env::temp_dir();
+    let wasm_file_path = temp_dir.join("example.wasm");
     let dummy_bytecode = create_dummy_wasm_bytecode();
+    tokio::fs::write(&wasm_file_path, &dummy_bytecode).await?;
+    
+    // Update module config with actual file path
+    let mut module_config = module_config;
+    module_config.path = wasm_file_path.to_string_lossy().to_string();
 
-    // Create module instance manually (in real usage, you would load from file)
-    let module = WasmModule::new(module_config.clone(), dummy_bytecode)?;
-    let module_arc = Arc::new(module);
-
-    // Register the module
-    {
-        let mut modules = manager.modules.write().await;
-        modules.insert(module_config.name.clone(), module_arc);
-    }
-
-    info!("Module '{}' loaded successfully", module_config.name);
+    // Load module using the manager
+    let module_id = manager.load_module(module_config.clone()).await?;
+    info!("Module '{}' loaded successfully with ID: {}", module_config.name, module_id);
 
     // Execute the module
     let input_data = serde_json::json!({
@@ -219,15 +218,19 @@ pub async fn security_example() -> Result<()> {
         },
     };
 
+    // Create a temporary WASM file for demonstration
+    let temp_dir = std::env::temp_dir();
+    let wasm_file_path = temp_dir.join("restricted.wasm");
     let dummy_bytecode = create_dummy_wasm_bytecode();
-    let module = WasmModule::new(restricted_config.clone(), dummy_bytecode)?;
-    let module_arc = Arc::new(module);
+    tokio::fs::write(&wasm_file_path, &dummy_bytecode).await?;
+    
+    // Update module config with actual file path
+    let mut restricted_config = restricted_config;
+    restricted_config.path = wasm_file_path.to_string_lossy().to_string();
 
-    // Register the module
-    {
-        let mut modules = manager.modules.write().await;
-        modules.insert(restricted_config.name.clone(), module_arc);
-    }
+    // Load module using the manager
+    let module_id = manager.load_module(restricted_config.clone()).await?;
+    info!("Restricted module loaded with ID: {}", module_id);
 
     // Try to execute with a dangerous function name
     let result = manager.execute_module(
@@ -290,14 +293,19 @@ pub async fn performance_monitoring_example() -> Result<()> {
             timeout_config: TimeoutConfig::default(),
         };
 
+        // Create a temporary WASM file for demonstration
+        let temp_dir = std::env::temp_dir();
+        let wasm_file_path = temp_dir.join(format!("perf_{}.wasm", i));
         let dummy_bytecode = create_dummy_wasm_bytecode();
-        let module = WasmModule::new(module_config.clone(), dummy_bytecode)?;
-        let module_arc = Arc::new(module);
+        tokio::fs::write(&wasm_file_path, &dummy_bytecode).await?;
+        
+        // Update module config with actual file path
+        let mut module_config = module_config;
+        module_config.path = wasm_file_path.to_string_lossy().to_string();
 
-        {
-            let mut modules = manager.modules.write().await;
-            modules.insert(module_config.name.clone(), module_arc);
-        }
+        // Load module using the manager
+        let module_id = manager.load_module(module_config.clone()).await?;
+        info!("Performance test module {} loaded with ID: {}", module_config.name, module_id);
 
         // Execute the module multiple times
         for j in 0..10 {

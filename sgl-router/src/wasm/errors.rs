@@ -424,7 +424,7 @@ impl WasmError {
 }
 
 /// 错误严重程度
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ErrorSeverity {
     /// 低严重程度 - 不影响核心功能
     Low,
@@ -579,6 +579,8 @@ impl ErrorStats {
         *self.errors_by_type.entry(error_type).or_insert(0) += 1;
         
         let severity = error.severity();
+        // Note: This would need ErrorSeverity to implement Hash
+        // For now, we'll just increment the total count
         *self.errors_by_severity.entry(severity).or_insert(0) += 1;
         
         self.last_error_time = Some(chrono::Utc::now());
@@ -621,7 +623,7 @@ mod tests {
         let security_error = WasmError::security_error("test", "unauthorized_access");
         assert_eq!(security_error.severity(), ErrorSeverity::Critical);
         
-        let config_error = WasmError::config_error("invalid config", Some("timeout"));
+        let config_error = WasmError::config_error("invalid config".to_string(), Some("timeout".to_string()));
         assert_eq!(config_error.severity(), ErrorSeverity::Medium);
     }
 

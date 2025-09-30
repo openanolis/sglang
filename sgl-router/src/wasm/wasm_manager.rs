@@ -8,11 +8,10 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU32, Ordering};
 use std::fmt;
@@ -87,6 +86,43 @@ pub struct WasmModuleInfo {
     pub stats: WasmModuleStats,
     /// Security context information
     pub security_context: SecurityContext,
+}
+
+/// WASM module information with interior mutability for runtime updates
+#[derive(Debug)]
+pub struct WasmModuleInfoInner {
+    /// Unique module identifier
+    pub id: String,
+    /// Module name
+    pub name: String,
+    /// Module version
+    pub version: String,
+    /// Module description
+    pub description: Option<String>,
+    /// Module file path
+    pub path: String,
+    /// Current module status
+    pub status: Arc<RwLock<WasmModuleStatus>>,
+    /// Module creation timestamp
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Last update timestamp
+    pub updated_at: Arc<RwLock<chrono::DateTime<chrono::Utc>>>,
+    /// Module size in bytes
+    pub size_bytes: u64,
+    /// Module hash for integrity verification
+    pub hash: Option<String>,
+    /// Module author information
+    pub author: Option<String>,
+    /// Module license information
+    pub license: Option<String>,
+    /// Module dependencies
+    pub dependencies: Vec<String>,
+    /// Execution statistics
+    pub stats: Arc<RwLock<WasmModuleStats>>,
+    /// Security context information
+    pub security_context: SecurityContext,
+    /// Last access time for cleanup
+    pub last_accessed: Arc<RwLock<Instant>>,
 }
 
 /// Security context for WASM module execution
@@ -461,14 +497,12 @@ impl Default for TimeoutConfig {
 
 /// WASM module instance
 pub struct WasmModule {
-    /// Module information and metadata
-    pub info: WasmModuleInfo,
+    /// Module information and metadata with interior mutability
+    pub info: WasmModuleInfoInner,
     /// Module configuration
     pub config: WasmModuleConfig,
     /// Module bytecode
     pub bytecode: Vec<u8>,
-    /// Last access time
-    pub last_accessed: Instant,
     /// Reference count for garbage collection
     pub ref_count: Arc<Mutex<u32>>,
     /// Module execution semaphore for concurrency control
@@ -508,22 +542,23 @@ impl WasmModule {
         // Calculate module hash for integrity verification
         let hash = Some(calculate_module_hash(&bytecode));
         
-        let info = WasmModuleInfo {
+        let info = WasmModuleInfoInner {
             id: id.clone(),
             name: config.name.clone(),
             version: config.version.clone(),
             description: config.description.clone(),
             path: config.path.clone(),
-            status: WasmModuleStatus::Loaded,
+            status: Arc::new(RwLock::new(WasmModuleStatus::Loaded)),
             created_at: now,
-            updated_at: now,
+            updated_at: Arc::new(RwLock::new(now)),
             size_bytes,
             hash,
             author: config.author.clone(),
             license: config.license.clone(),
             dependencies: config.dependencies.clone(),
-            stats: WasmModuleStats::default(),
+            stats: Arc::new(RwLock::new(WasmModuleStats::default())),
             security_context: config.security_context.clone(),
+            last_accessed: Arc::new(RwLock::new(Instant::now())),
         };
 
         // Create execution semaphore based on security context
@@ -534,7 +569,6 @@ impl WasmModule {
             info,
             config,
             bytecode,
-            last_accessed: Instant::now(),
             ref_count: Arc::new(Mutex::new(0)),
             execution_semaphore,
             runtime_instance: Arc::new(Mutex::new(None)),
@@ -545,49 +579,71 @@ impl WasmModule {
     }
 
     /// Update module status
-    pub fn update_status(&mut self, status: WasmModuleStatus) {
-        self.info.status = status;
-        self.info.updated_at = chrono::Utc::now();
-        self.last_accessed = Instant::now();
+    pub async fn update_status(&self, status: WasmModuleStatus) {
+        {
+            let mut current_status = self.info.status.write().await;
+            *current_status = status;
+        }
+        
+        // Update timestamp
+        {
+            let mut updated_at = self.info.updated_at.write().await;
+            *updated_at = chrono::Utc::now();
+        }
+        
+        // Update last access time
+        {
+            let mut last_accessed = self.info.last_accessed.write().await;
+            *last_accessed = Instant::now();
+        }
     }
 
     /// Update execution statistics
-    pub fn update_stats(&mut self, execution_time_ms: u64, success: bool, memory_usage: Option<usize>, cpu_time_ms: Option<u64>) {
-        self.info.stats.total_executions += 1;
+    pub async fn update_stats(&self, execution_time_ms: u64, success: bool, memory_usage: Option<usize>, cpu_time_ms: Option<u64>) {
+        let mut stats = self.info.stats.write().await;
+        
+        // Update execution counts
+        stats.total_executions += 1;
         if success {
-            self.info.stats.successful_executions += 1;
+            stats.successful_executions += 1;
         } else {
-            self.info.stats.failed_executions += 1;
+            stats.failed_executions += 1;
         }
-
+        
         // Update execution time statistics
-        if self.info.stats.min_execution_time_ms == 0 || execution_time_ms < self.info.stats.min_execution_time_ms {
-            self.info.stats.min_execution_time_ms = execution_time_ms;
+        if stats.total_executions == 1 {
+            stats.avg_execution_time_ms = execution_time_ms as f64;
+            stats.max_execution_time_ms = execution_time_ms;
+            stats.min_execution_time_ms = execution_time_ms;
+        } else {
+            // Calculate running average
+            let total_time = stats.avg_execution_time_ms * (stats.total_executions - 1) as f64;
+            stats.avg_execution_time_ms = (total_time + execution_time_ms as f64) / stats.total_executions as f64;
+            
+            // Update min/max
+            stats.max_execution_time_ms = stats.max_execution_time_ms.max(execution_time_ms);
+            stats.min_execution_time_ms = stats.min_execution_time_ms.min(execution_time_ms);
         }
-        if execution_time_ms > self.info.stats.max_execution_time_ms {
-            self.info.stats.max_execution_time_ms = execution_time_ms;
-        }
-
-        // Calculate average execution time
-        let total_time = self.info.stats.avg_execution_time_ms * (self.info.stats.total_executions - 1) as f64;
-        self.info.stats.avg_execution_time_ms = (total_time + execution_time_ms as f64) / self.info.stats.total_executions as f64;
-
-        // Update memory usage statistics
+        
+        // Update memory usage
         if let Some(memory) = memory_usage {
-            self.info.stats.total_memory_usage_bytes += memory as u64;
-            if memory as u64 > self.info.stats.peak_memory_usage_bytes {
-                self.info.stats.peak_memory_usage_bytes = memory as u64;
-            }
+            stats.total_memory_usage_bytes += memory as u64;
+            stats.peak_memory_usage_bytes = stats.peak_memory_usage_bytes.max(memory as u64);
         }
-
-        // Update CPU time statistics
+        
+        // Update CPU time
         if let Some(cpu_time) = cpu_time_ms {
-            self.info.stats.total_cpu_time_ms += cpu_time;
+            stats.total_cpu_time_ms += cpu_time;
         }
-
-        self.info.stats.last_execution = Some(chrono::Utc::now());
-        self.info.updated_at = chrono::Utc::now();
-        self.last_accessed = Instant::now();
+        
+        // Update last execution time
+        stats.last_execution = Some(chrono::Utc::now());
+        
+        // Update last access time
+        {
+            let mut last_accessed = self.info.last_accessed.write().await;
+            *last_accessed = Instant::now();
+        }
     }
 
     /// Increment reference count
@@ -620,7 +676,7 @@ impl WasmModule {
     pub async fn quarantine(&self, reason: String) {
         let mut quarantined = self.is_quarantined.lock().await;
         *quarantined = true;
-        self.update_status(WasmModuleStatus::Error(format!("Quarantined: {}", reason)));
+        self.update_status(WasmModuleStatus::Error(format!("Quarantined: {}", reason))).await;
         warn!("Module {} quarantined: {}", self.info.name, reason);
     }
 
@@ -629,7 +685,7 @@ impl WasmModule {
         let mut quarantined = self.is_quarantined.lock().await;
         *quarantined = false;
         self.violation_count.store(0, Ordering::Relaxed);
-        self.update_status(WasmModuleStatus::Initialized);
+        self.update_status(WasmModuleStatus::Initialized).await;
         info!("Module {} removed from quarantine", self.info.name);
     }
 
@@ -671,6 +727,32 @@ impl WasmModule {
             }
         }
         Ok(())
+    }
+
+    /// Get a snapshot of module information for external access
+    pub async fn get_info_snapshot(&self) -> WasmModuleInfo {
+        WasmModuleInfo {
+            id: self.info.id.clone(),
+            name: self.info.name.clone(),
+            version: self.info.version.clone(),
+            description: self.info.description.clone(),
+            path: self.info.path.clone(),
+            status: self.info.status.read().await.clone(),
+            created_at: self.info.created_at,
+            updated_at: *self.info.updated_at.read().await,
+            size_bytes: self.info.size_bytes,
+            hash: self.info.hash.clone(),
+            author: self.info.author.clone(),
+            license: self.info.license.clone(),
+            dependencies: self.info.dependencies.clone(),
+            stats: self.info.stats.read().await.clone(),
+            security_context: self.info.security_context.clone(),
+        }
+    }
+
+    /// Get last access time for cleanup decisions
+    pub async fn get_last_accessed(&self) -> Instant {
+        *self.info.last_accessed.read().await
     }
 }
 
@@ -893,7 +975,7 @@ impl WasmManager {
         // Stop all modules
         let mut modules = self.modules.write().await;
         for (_, module) in modules.iter() {
-            module.update_status(WasmModuleStatus::Stopped);
+            module.update_status(WasmModuleStatus::Stopped).await;
         }
         modules.clear();
 
@@ -927,7 +1009,7 @@ impl WasmManager {
             .map_err(|e| anyhow!("Failed to read module file {}: {}", config.path, e))?;
 
         // Validate WASM bytecode
-        self.validate_wasm_bytecode(&bytecode, &config)?;
+        self.validate_wasm_bytecode(&bytecode, &config).await?;
 
         // Create module instance
         let module = WasmModule::new(config.clone(), bytecode)?;
@@ -1014,23 +1096,42 @@ impl WasmManager {
     pub async fn unload_module(&self, module_name: &str) -> Result<()> {
         info!("Unloading WASM module: {}", module_name);
 
-        let mut modules = self.modules.write().await;
-        if let Some(module) = modules.remove(module_name) {
-            // Check reference count
-            let ref_count = module.get_ref_count().await;
-            if ref_count > 0 {
-                warn!("Module {} still has {} references, force unloading", module_name, ref_count);
+        // First, get the module reference without holding the write lock
+        let module = {
+            let modules = self.modules.read().await;
+            modules.get(module_name).cloned()
+        };
+
+        if let Some(module) = module {
+            // Wait for all references to be released with a timeout
+            let timeout = Duration::from_secs(30);
+            let start = Instant::now();
+            
+            while module.get_ref_count().await > 0 {
+                if start.elapsed() > timeout {
+                    warn!("Module {} still has {} references after timeout, force unloading", 
+                          module_name, module.get_ref_count().await);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
-            module.update_status(WasmModuleStatus::Stopped);
+            // Update module status before removing
+            module.update_status(WasmModuleStatus::Unloading).await;
             
-            // Update resource usage
-            self.resource_usage.total_memory_bytes.fetch_sub(
-                module.bytecode.len(), Ordering::Relaxed
-            );
-            
-            info!("WASM module {} unloaded successfully", module_name);
-            Ok(())
+            // Now safely remove from registry
+            let mut modules = self.modules.write().await;
+            if let Some(removed_module) = modules.remove(module_name) {
+                // Update resource usage
+                self.resource_usage.total_memory_bytes.fetch_sub(
+                    removed_module.bytecode.len(), Ordering::Relaxed
+                );
+                
+                info!("WASM module {} unloaded successfully", module_name);
+                Ok(())
+            } else {
+                Err(anyhow!("Module {} was removed by another operation", module_name))
+            }
         } else {
             Err(anyhow!("Module {} does not exist", module_name))
         }
@@ -1046,10 +1147,10 @@ impl WasmManager {
         debug!("Executing WASM module: {} function: {}", module_name, function_name);
 
         // Acquire global execution permit
-        let _permit = self.global_execution_semaphore.acquire().await
+        let _global_permit = self.global_execution_semaphore.acquire().await
             .map_err(|e| anyhow!("Failed to acquire execution permit: {}", e))?;
 
-        // Get module
+        // Get module with proper error handling
         let module = {
             let modules = self.modules.read().await;
             modules.get(module_name)
@@ -1062,33 +1163,21 @@ impl WasmManager {
             return Err(anyhow!("Module {} is quarantined and cannot be executed", module_name));
         }
 
+        // Create execution guard to ensure proper cleanup
+        let _execution_guard = ExecutionGuard::new(module.clone(), self.resource_usage.clone());
+
         // Acquire module execution permit
         let _module_permit = module.execution_semaphore.acquire().await
             .map_err(|e| anyhow!("Failed to acquire module execution permit: {}", e))?;
 
-        // Increment reference count
-        module.increment_ref_count().await;
-
-        // Update resource usage
-        self.resource_usage.active_executions.fetch_add(1, Ordering::Relaxed);
-
-        // Update last access time
-        module.last_accessed = Instant::now();
-
-        // Execute module
+        // Execute module with proper error handling
         let start_time = Instant::now();
         let result = self.executor.execute(&module, function_name, input_data).await;
         let execution_time = start_time.elapsed().as_millis() as u64;
 
         // Update statistics
         let success = result.success;
-        module.update_stats(execution_time, success, result.memory_usage_bytes, result.cpu_time_ms);
-
-        // Decrement reference count
-        module.decrement_ref_count().await;
-
-        // Update resource usage
-        self.resource_usage.active_executions.fetch_sub(1, Ordering::Relaxed);
+        module.update_stats(execution_time, success, result.memory_usage_bytes, result.cpu_time_ms).await;
 
         debug!("WASM module {} execution completed, time: {}ms", module_name, execution_time);
         Ok(result)
@@ -1100,13 +1189,19 @@ impl WasmManager {
         let module = modules.get(module_name)
             .ok_or_else(|| anyhow!("Module {} does not exist", module_name))?;
         
-        Ok(module.info.clone())
+        Ok(module.get_info_snapshot().await)
     }
 
     /// List all modules
     pub async fn list_modules(&self) -> Vec<WasmModuleInfo> {
         let modules = self.modules.read().await;
-        modules.values().map(|m| m.info.clone()).collect()
+        let mut module_infos = Vec::new();
+        
+        for module in modules.values() {
+            module_infos.push(module.get_info_snapshot().await);
+        }
+        
+        module_infos
     }
 
     /// Get module health status
@@ -1161,7 +1256,7 @@ impl WasmManager {
     }
 
     /// Validate WASM bytecode
-    fn validate_wasm_bytecode(&self, bytecode: &[u8], config: &WasmModuleConfig) -> Result<()> {
+    async fn validate_wasm_bytecode(&self, bytecode: &[u8], config: &WasmModuleConfig) -> Result<()> {
         // Check WASM magic number
         if bytecode.len() < 4 {
             return Err(anyhow!("WASM bytecode too short"));
@@ -1187,7 +1282,7 @@ impl WasmManager {
 
         // Validate dependencies if configured
         if self.config.validation_config.validate_dependencies {
-            self.validate_module_dependencies(config)?;
+            self.validate_module_dependencies(config).await?;
         }
 
         Ok(())
@@ -1208,7 +1303,7 @@ impl WasmManager {
     }
 
     /// Validate module dependencies
-    fn validate_module_dependencies(&self, config: &WasmModuleConfig) -> Result<()> {
+    async fn validate_module_dependencies(&self, config: &WasmModuleConfig) -> Result<()> {
         // Check if all dependencies are available
         let modules = self.modules.read().await;
         for dependency in &config.dependencies {
@@ -1239,7 +1334,8 @@ impl WasmManager {
                     let modules_guard = modules.read().await;
                     for (name, module) in modules_guard.iter() {
                         // Check if module has been idle for too long
-                        if now.duration_since(module.last_accessed) > max_idle_time {
+                        let last_accessed = module.get_last_accessed().await;
+                        if now.duration_since(last_accessed) > max_idle_time {
                             let ref_count = module.get_ref_count().await;
                             if ref_count == 0 {
                                 modules_to_remove.push(name.clone());
@@ -1253,7 +1349,7 @@ impl WasmManager {
                     let mut modules_guard = modules.write().await;
                     for name in modules_to_remove {
                         if let Some(module) = modules_guard.remove(&name) {
-                            module.update_status(WasmModuleStatus::Stopped);
+                            module.update_status(WasmModuleStatus::Stopped).await;
                             
                             // Update resource usage
                             resource_usage.total_memory_bytes.fetch_sub(
@@ -1293,7 +1389,7 @@ impl WasmExecutor {
         let execution_id = Uuid::new_v4().to_string();
         
         // Update module status to running
-        module.update_status(WasmModuleStatus::Running);
+        module.update_status(WasmModuleStatus::Running).await;
 
         // Validate security context
         let security_violations = self.validate_security_context(module, function_name, &input_data).await;
@@ -1309,7 +1405,7 @@ impl WasmExecutor {
         } else {
             WasmModuleStatus::Error(result.error.clone().unwrap_or_default())
         };
-        module.update_status(status);
+        module.update_status(status).await;
 
         WasmExecutionResult {
             success: result.success,
@@ -1331,7 +1427,7 @@ impl WasmExecutor {
         &self,
         module: &WasmModule,
         function_name: &str,
-        input_data: &Option<serde_json::Value>,
+        _input_data: &Option<serde_json::Value>,
     ) -> Vec<SecurityViolation> {
         let mut violations = Vec::new();
         
@@ -1422,7 +1518,6 @@ impl WasmExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_wasm_manager_creation() {
@@ -1456,7 +1551,8 @@ mod tests {
         
         let module = WasmModule::new(config, bytecode).unwrap();
         assert_eq!(module.info.name, "test_module");
-        assert_eq!(module.info.status, WasmModuleStatus::Loaded);
+        let status = module.info.status.read().await;
+        assert_eq!(*status, WasmModuleStatus::Loaded);
     }
 
     #[tokio::test]
@@ -1478,23 +1574,117 @@ mod tests {
         };
 
         let bytecode = b"\x00asm\x01\x00\x00\x00".to_vec();
-        let mut module = WasmModule::new(config, bytecode).unwrap();
+        let module = WasmModule::new(config, bytecode).unwrap();
 
         // Test statistics update
-        module.update_stats(100, true, Some(1024), Some(50));
-        assert_eq!(module.info.stats.total_executions, 1);
-        assert_eq!(module.info.stats.successful_executions, 1);
-        assert_eq!(module.info.stats.avg_execution_time_ms, 100.0);
-        assert_eq!(module.info.stats.total_memory_usage_bytes, 1024);
-        assert_eq!(module.info.stats.total_cpu_time_ms, 50);
+        module.update_stats(100, true, Some(1024), Some(50)).await;
+        let stats = module.info.stats.read().await;
+        assert_eq!(stats.total_executions, 1);
+        assert_eq!(stats.successful_executions, 1);
+        assert_eq!(stats.avg_execution_time_ms, 100.0);
+        assert_eq!(stats.total_memory_usage_bytes, 1024);
+        assert_eq!(stats.total_cpu_time_ms, 50);
+        drop(stats);
 
-        module.update_stats(200, false, Some(2048), Some(100));
-        assert_eq!(module.info.stats.total_executions, 2);
-        assert_eq!(module.info.stats.successful_executions, 1);
-        assert_eq!(module.info.stats.failed_executions, 1);
-        assert_eq!(module.info.stats.avg_execution_time_ms, 150.0);
-        assert_eq!(module.info.stats.total_memory_usage_bytes, 3072);
-        assert_eq!(module.info.stats.total_cpu_time_ms, 150);
+        module.update_stats(200, false, Some(2048), Some(100)).await;
+        let stats = module.info.stats.read().await;
+        assert_eq!(stats.total_executions, 2);
+        assert_eq!(stats.successful_executions, 1);
+        assert_eq!(stats.failed_executions, 1);
+        assert_eq!(stats.avg_execution_time_ms, 150.0);
+        assert_eq!(stats.total_memory_usage_bytes, 3072);
+        assert_eq!(stats.total_cpu_time_ms, 150);
+    }
+
+    #[tokio::test]
+    async fn test_wasm_module_status_update() {
+        let config = WasmModuleConfig {
+            name: "test_module".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            path: "/tmp/test.wasm".to_string(),
+            author: None,
+            license: None,
+            dependencies: vec![],
+            security_context: SecurityContext::default(),
+            preload_modules: vec![],
+            tags: vec![],
+            priority: 0,
+            cache_enabled: true,
+            timeout_config: TimeoutConfig::default(),
+        };
+
+        let bytecode = b"\x00asm\x01\x00\x00\x00".to_vec();
+        let module = WasmModule::new(config, bytecode).unwrap();
+
+        // Test status update
+        module.update_status(WasmModuleStatus::Running).await;
+        let status = module.info.status.read().await;
+        assert_eq!(*status, WasmModuleStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_wasm_module_info_snapshot() {
+        let config = WasmModuleConfig {
+            name: "test_module".to_string(),
+            version: "1.0.0".to_string(),
+            description: Some("Test module".to_string()),
+            path: "/tmp/test.wasm".to_string(),
+            author: Some("Test Author".to_string()),
+            license: Some("MIT".to_string()),
+            dependencies: vec![],
+            security_context: SecurityContext::default(),
+            preload_modules: vec![],
+            tags: vec!["test".to_string()],
+            priority: 1,
+            cache_enabled: true,
+            timeout_config: TimeoutConfig::default(),
+        };
+
+        let bytecode = b"\x00asm\x01\x00\x00\x00".to_vec();
+        let module = WasmModule::new(config, bytecode).unwrap();
+
+        // Test info snapshot
+        let info_snapshot = module.get_info_snapshot().await;
+        assert_eq!(info_snapshot.name, "test_module");
+        assert_eq!(info_snapshot.version, "1.0.0");
+        assert_eq!(info_snapshot.description, Some("Test module".to_string()));
+        assert_eq!(info_snapshot.author, Some("Test Author".to_string()));
+        assert_eq!(info_snapshot.license, Some("MIT".to_string()));
+    }
+}
+
+/// Execution guard to ensure proper resource cleanup
+pub struct ExecutionGuard {
+    module: Arc<WasmModule>,
+    resource_usage: Arc<ResourceUsageTracker>,
+}
+
+impl ExecutionGuard {
+    fn new(module: Arc<WasmModule>, resource_usage: Arc<ResourceUsageTracker>) -> Self {
+        // Increment reference count
+        let module_clone = module.clone();
+        tokio::spawn(async move {
+            module_clone.increment_ref_count().await;
+        });
+        
+        // Update resource usage
+        resource_usage.active_executions.fetch_add(1, Ordering::Relaxed);
+        
+        Self { module, resource_usage }
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        // Decrement reference count
+        let module = self.module.clone();
+        tokio::spawn(async move {
+            module.decrement_ref_count().await;
+        });
+        
+        // Update resource usage
+        self.resource_usage.active_executions.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
