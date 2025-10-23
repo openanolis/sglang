@@ -306,6 +306,81 @@ class SchedulePolicy:
             )
         q.extend(last_node_to_reqs[cur_node])
 
+class ScheduleCFS():
+    def __init__(self, waiting_queue: List[Req], running_batch: ScheduleBatch):
+        self.min_vruntime: int = 0
+        self.total_weight: int = self.calc_total_weight()
+        self.lock = RWLock()
+        self.waiting_queue: List[Req] = waiting_queue
+        self.running_batch: ScheduleBatch = running_batch
+        self.running_queue: List[Req]
+
+    def prio_to_weight(prio: int):
+
+    def vruntime_award(prio: int):
+    
+    def calc_total_weight(self):
+        with self.lock.read_acquire():
+
+    def get_total_weight(self):
+        with self.lock.read_acquire():
+            return self.total_weight
+
+    def update_total_weight(self, prio: int, enqueue: bool):
+        with self.lock.write_acquire():
+            if enqueue:
+                self.total_weight += prio_to_weight(prio)
+            else:
+                self.total_weight -= prio_to_weight(prio)
+
+    def req_enqueue(self, req: Req):
+        Req.weight = self.prio_to_weight(req.priority)
+        self.update_total_weight(self, req.priority, True)
+        with self.lock.read_acquire():
+            Req.vruntime = self.min_vruntime + vruntime_award(req.priority)
+
+    def req_dequeue(self, req: Req):
+        self.update_total_weight(self, req.priority, False)
+
+    def update_priority(self, req: Req, new_prio: int):
+        with self.lock.write_acquire():
+            self.update_total_weight(self, new_prio, False)
+            req.priority = prio_to_weight(new_prio)
+            self.update_total_weight(self, new_prio, True)
+
+    def update_min_vruntime(self):
+        INF = float('inf')
+        if self.running_queue:
+            min_running_vruntime = self.running_queue[0].vruntime
+        else:
+            min_running_vruntime = INF
+
+        if self.waiting_queue:
+            min_waiting_vruntime = self.waiting_queue[0].vruntime
+        else:
+            min_waiting_vruntime = INF
+
+        min_vruntime = min(min_running_vruntime, min_waiting_vruntime)
+        
+        if min_vruntime == INF:
+            return
+        else:
+            self.min_vruntime = max(min_vruntime, self.min_vruntime)
+
+    def get_min_waiting_req(self):
+        return self.waiting_queue[0]
+
+    def get_max_running_req(self):
+        return self.running_queue[-1]
+
+    @staticmethod
+    def _sort_by_vruntime(self) -> None:
+        self.waiting_queue.sort(
+            key=lambda x: (x.vruntime)
+        )
+        self.running_queue.sort(
+            key=lambda x: (x.vruntime)
+        )
 
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
