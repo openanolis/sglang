@@ -60,6 +60,7 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 IGNORE_EOS_RESERVE_TOKENS = 1
 
+CFS_MAX_WEIGHT = 1_000_000.0
 
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
@@ -307,20 +308,30 @@ class SchedulePolicy:
         q.extend(last_node_to_reqs[cur_node])
 
 class ScheduleCFS():
-    def __init__(self, waiting_queue: List[Req], running_batch: ScheduleBatch):
+    def __init__(self, waiting_queue: List[Req], running_batch: ScheduleBatch, schedule_low_priority_values_first: bool):
         self.min_vruntime: int = 0
         self.total_weight: int = self.calc_total_weight()
         self.lock = RWLock()
         self.waiting_queue: List[Req] = waiting_queue
         self.running_batch: ScheduleBatch = running_batch
         self.running_queue: List[Req]
+        self.cfs_max_weight = CFS_MAX_WEIGHT
+        self.schedule_low_priority_values_first = schedule_low_priority_values_first
 
-    def prio_to_weight(prio: int):
+    def prio_to_weight(prio: int) -> float:
+        if self.schedule_low_priority_values_first:
+            return float(prio)
+        else:
+            if prio == 0:
+                return CFS_MAX_WEIGHT
+            return CFS_MAX_WEIGHT/prio
 
     def vruntime_award(prio: int):
     
     def calc_total_weight(self):
         with self.lock.read_acquire():
+            all_reqs = self.waiting_queue + (self.running_batch.reqs if self.running_batch else [])
+            return sum(prio_to_weight(req.priority, self.schedule_low_priority_values_first) for req in all_reqs)
 
     def get_total_weight(self):
         with self.lock.read_acquire():
