@@ -283,7 +283,9 @@ class SchedulerPPMixin:
                         (
                             event,
                             PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, self.cur_batch)
+                                self._pp_prepare_hidden_tensor_dict(
+                                    result, self.cur_batch
+                                )
                             ),
                         )
                     )
