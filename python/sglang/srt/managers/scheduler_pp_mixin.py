@@ -202,6 +202,7 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
         output_comm_queue: deque[PPProxyTensors],
         send_output_work: List[P2PWork],
+        pp_output_is_none: List[bool],
     ) -> Tuple[PPProxyTensors, List[P2PWork], torch.cuda.Event]:
         next_pp_outputs = None
         d2h_event = None
@@ -219,6 +220,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
                 if not self.pp_group.is_last_rank:
                     output_comm_queue.append(next_pp_outputs)
+                    pp_output_is_none[next_mb_id] = False
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.default_stream)
                 batch_result = self._pp_prep_batch_result(
@@ -319,13 +321,14 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
         mbs = [None] * self.pp_loop_size
         last_mbs = [None] * self.pp_loop_size
+        pp_output_is_none = [True] * self.pp_loop_size
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False)
             for _ in range(self.pp_loop_size)
         ]
         mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
-        output_comm_queue: deque[PPProxyTensors] = deque([None] * self.pp_loop_size)
+        output_comm_queue: deque[PPProxyTensors] = deque()
         hidden_states_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = (
             deque()
         )
@@ -367,8 +370,13 @@ class SchedulerPPMixin:
                         last_rank_comm_queue,
                         output_comm_queue,
                         send_output_work,
+                        pp_output_is_none,
                     )
                 if self.cur_batch:
+                    if not self.pp_group.is_last_rank:
+                        if pp_output_is_none[mb_id]:
+                            output_comm_queue.append(None)
+                        pp_output_is_none[mb_id] = True
                     self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
@@ -386,6 +394,7 @@ class SchedulerPPMixin:
                         last_rank_comm_queue,
                         output_comm_queue,
                         send_output_work,
+                        pp_output_is_none,
                     )
                 if mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
