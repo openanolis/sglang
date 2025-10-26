@@ -190,27 +190,17 @@ class SchedulerPPMixin:
                 output_comm_buffer[next_first_rank_mb_id] = None
         return new_send_output_work
 
-    def _pp_send_recv_and_preprocess_output_tensors(
+    def _pp_recv_and_preprocess_output_tensors(
         self: Scheduler,
-        next_first_rank_mb_id: int,
         next_mb_id: int,
         mbs: List[ScheduleBatch],
         last_mbs: List[ScheduleBatch],
         mb_metadata: List[PPBatchMetadata],
-        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
         output_comm_buffer: deque[PPProxyTensors],
-        send_output_work: List[P2PWork],
     ) -> Tuple[PPProxyTensors, List[P2PWork], torch.cuda.Event]:
         next_pp_outputs = None
         d2h_event = None
         batch_result = None
-        new_send_output_work = self._pp_send_output_to_next_stage(
-            next_first_rank_mb_id,
-            mbs,
-            last_rank_comm_queue,
-            output_comm_buffer,
-            send_output_work,
-        )
         if mbs[next_mb_id] is not None:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
@@ -230,7 +220,7 @@ class SchedulerPPMixin:
                 d2h_event = torch.cuda.Event()
                 d2h_event.record(torch.cuda.current_stream())
 
-        return new_send_output_work, d2h_event
+        return d2h_event
 
     def _pp_send_hidden_states_to_next_stage(
         self: Scheduler,
@@ -357,6 +347,17 @@ class SchedulerPPMixin:
                     mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
+                if (
+                    self.server_args.pp_async_batch_depth > 0
+                    or not self.pp_group.is_last_rank
+                ):
+                    send_output_work = self._pp_send_output_to_next_stage(
+                        next_first_rank_mb_id,
+                        mbs,
+                        last_rank_comm_queue,
+                        output_comm_buffer,
+                        send_output_work,
+                    )
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -365,17 +366,12 @@ class SchedulerPPMixin:
                     self.server_args.pp_async_batch_depth > 0
                     or not self.pp_group.is_last_rank
                 ):
-                    send_output_work, d2h_event = (
-                        self._pp_send_recv_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                            mbs,
-                            last_mbs,
-                            mb_metadata,
-                            last_rank_comm_queue,
-                            output_comm_buffer,
-                            send_output_work,
-                        )
+                    d2h_event = self._pp_recv_and_preprocess_output_tensors(
+                        next_mb_id,
+                        mbs,
+                        last_mbs,
+                        mb_metadata,
+                        output_comm_buffer,
                     )
                 if self.server_args.pp_async_batch_depth > 0:
                     send_proxy_work = self._pp_send_hidden_states_to_next_stage(
@@ -395,17 +391,19 @@ class SchedulerPPMixin:
                     self.server_args.pp_async_batch_depth == 0
                     and self.pp_group.is_last_rank
                 ):
-                    send_output_work, d2h_event = (
-                        self._pp_send_recv_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                            mbs,
-                            last_mbs,
-                            mb_metadata,
-                            last_rank_comm_queue,
-                            output_comm_buffer,
-                            send_output_work,
-                        )
+                    send_output_work = self._pp_send_output_to_next_stage(
+                        next_first_rank_mb_id,
+                        mbs,
+                        last_rank_comm_queue,
+                        output_comm_buffer,
+                        send_output_work,
+                    )
+                    d2h_event = self._pp_recv_and_preprocess_output_tensors(
+                        next_mb_id,
+                        mbs,
+                        last_mbs,
+                        mb_metadata,
+                        output_comm_buffer,
                     )
                 if self.server_args.pp_async_batch_depth == 0:
                     send_proxy_work = self._pp_send_hidden_states_to_next_stage(
