@@ -326,6 +326,7 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
         output_comm_buffer = [None] * self.pp_loop_size
         hidden_states_comm_buffer = [None] * self.pp_loop_size
+        req_queue_buffer = [None] * self.pp_loop_size
         send_req_work = []
         send_proxy_work = []
         send_output_work = []
@@ -338,14 +339,20 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
+                    req_queue_buffer[mb_id] = recv_reqs
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
+                if (
+                    not self.pp_group.is_last_rank
+                    and req_queue_buffer[next_first_rank_mb_id] is not None
+                ):
                     self._pp_commit_comm_work(send_req_work)
+                    send_reqs = req_queue_buffer[next_first_rank_mb_id]
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
+                            send_reqs,
                             async_send=True,
                         )
+                    req_queue_buffer[next_first_rank_mb_id] = None
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
@@ -354,7 +361,10 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 d2h_event = None
-                if self.server_args.pp_async_batch_depth > 0:
+                if (
+                    self.server_args.pp_async_batch_depth > 0
+                    or not self.pp_group.is_last_rank
+                ):
                     send_output_work, d2h_event = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -366,6 +376,12 @@ class SchedulerPPMixin:
                             output_comm_buffer,
                             send_output_work,
                         )
+                    )
+                if self.server_args.pp_async_batch_depth > 0:
+                    send_proxy_work = self._pp_send_hidden_states_to_next_stage(
+                        next_first_rank_mb_id,
+                        hidden_states_comm_buffer,
+                        send_proxy_work,
                     )
                 if self.cur_batch:
                     self._pp_launch_batch(
@@ -375,7 +391,10 @@ class SchedulerPPMixin:
                         last_rank_comm_queue,
                         hidden_states_comm_buffer,
                     )
-                if self.server_args.pp_async_batch_depth == 0:
+                if (
+                    self.server_args.pp_async_batch_depth == 0
+                    and self.pp_group.is_last_rank
+                ):
                     send_output_work, d2h_event = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -388,11 +407,14 @@ class SchedulerPPMixin:
                             send_output_work,
                         )
                     )
+                if self.server_args.pp_async_batch_depth == 0:
+                    send_proxy_work = self._pp_send_hidden_states_to_next_stage(
+                        next_first_rank_mb_id,
+                        hidden_states_comm_buffer,
+                        send_proxy_work,
+                    )
                 if mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
-                send_proxy_work = self._pp_send_hidden_states_to_next_stage(
-                    next_first_rank_mb_id, hidden_states_comm_buffer, send_proxy_work
-                )
                 # if self.delayed_weight_sync_fn:
                 #     self.delayed_weight_sync_fn()
                 #     self.delayed_weight_sync_fn = None
