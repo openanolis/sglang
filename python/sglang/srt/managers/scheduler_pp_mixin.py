@@ -358,6 +358,12 @@ class SchedulerPPMixin:
                         output_comm_buffer,
                         send_output_work,
                     )
+                if self.server_args.pp_async_batch_depth > 0:
+                    send_proxy_work = self._pp_send_hidden_states_to_next_stage(
+                        next_first_rank_mb_id,
+                        hidden_states_comm_buffer,
+                        send_proxy_work,
+                    )
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -372,12 +378,6 @@ class SchedulerPPMixin:
                         last_mbs,
                         mb_metadata,
                         output_comm_buffer,
-                    )
-                if self.server_args.pp_async_batch_depth > 0:
-                    send_proxy_work = self._pp_send_hidden_states_to_next_stage(
-                        next_first_rank_mb_id,
-                        hidden_states_comm_buffer,
-                        send_proxy_work,
                     )
                 if self.cur_batch:
                     self._pp_launch_batch(
