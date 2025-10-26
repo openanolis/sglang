@@ -367,18 +367,6 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                d2h_event = None
-                if (
-                    self.server_args.pp_async_batch_depth > 0
-                    or not self.pp_group.is_last_rank
-                ):
-                    d2h_event = self._pp_recv_and_preprocess_output_tensors(
-                        next_mb_id,
-                        mbs,
-                        last_mbs,
-                        mb_metadata,
-                        output_comm_buffer,
-                    )
                 if self.cur_batch:
                     self._pp_launch_batch(
                         mb_id,
@@ -398,13 +386,13 @@ class SchedulerPPMixin:
                         output_comm_buffer,
                         send_output_work,
                     )
-                    d2h_event = self._pp_recv_and_preprocess_output_tensors(
-                        next_mb_id,
-                        mbs,
-                        last_mbs,
-                        mb_metadata,
-                        output_comm_buffer,
-                    )
+                d2h_event = self._pp_recv_and_preprocess_output_tensors(
+                    next_mb_id,
+                    mbs,
+                    last_mbs,
+                    mb_metadata,
+                    output_comm_buffer,
+                )
                 if self.server_args.pp_async_batch_depth == 0:
                     send_proxy_work = self._pp_send_hidden_states_to_next_stage(
                         next_first_rank_mb_id,
