@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -14,13 +13,8 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-    RequestStage,
-    ScheduleBatch,
-)
-from sglang.srt.tracing.trace import trace_slice
+from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.tracing.req_time_recorder import RequestStage
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -112,7 +106,6 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -167,9 +160,8 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
-                    trace_slice(
+                    req.time_recorder.metric_trace_slice(
                         RequestStage.PREFILL_FORWARD,
-                        req.rid,
                         auto_next_anon=not req.finished(),
                         thread_finish_flag=req.finished(),
                     )
@@ -202,10 +194,9 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-                    trace_slice(
+                    req.time_recorder.metric_trace_slice(
                         RequestStage.PREFILL_CHUNKED_FORWARD,
-                        req.rid,
-                        auto_next_anon=True,
+                        auto_next_anon=(req.is_chunked != 0),
                     )
 
         else:  # embedding or reward model
@@ -236,6 +227,12 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(0)
                     req.check_finished()
 
+                    req.time_recorder.metric_trace_slice(
+                        RequestStage.PREFILL_FORWARD,
+                        auto_next_anon=not req.finished(),
+                        thread_finish_flag=req.finished(),
+                    )
+
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
                     else:
@@ -244,12 +241,10 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-                trace_slice(
-                    RequestStage.PREFILL_FORWARD,
-                    req.rid,
-                    auto_next_anon=not req.finished(),
-                    thread_finish_flag=req.finished(),
-                )
+                    req.time_recorder.metric_trace_slice(
+                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        auto_next_anon=(req.is_chunked != 0),
+                    )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
@@ -374,8 +369,6 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_finished_req(req)
                 else:
                     self.tree_cache.cache_finished_req(req)
-
-                req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding

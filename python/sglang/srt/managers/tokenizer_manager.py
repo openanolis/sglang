@@ -68,7 +68,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -76,14 +75,14 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.tracing.trace import (
-    trace_get_proc_propagate_context,
-    trace_req_finish,
-    trace_req_start,
-    trace_set_remote_propagate_context,
-    trace_slice_end,
-    trace_slice_start,
+from sglang.srt.tracing.req_time_recorder import (
+    RequestStage,
+    RequestTimeRecorder,
+    gloabl_del_timer_recorder,
+    global_get_time_recorder,
+    global_set_time_recorder,
 )
+from sglang.srt.tracing.trace import trace_set_remote_propagate_context_batch
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,
@@ -161,7 +160,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else None
         )
         self.crash_dump_folder = server_args.crash_dump_folder
-        self.enable_trace = server_args.enable_trace
 
         # Read model args
         self.model_path = server_args.model_path
@@ -387,13 +385,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         if request:
             if "trace_context" in request.headers:
-                trace_set_remote_propagate_context(request.headers["trace_context"])
+                trace_set_remote_propagate_context_batch(
+                    request.headers["trace_context"]
+                )
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
-        if self.enable_trace:
-            self._trace_request_start(obj, created_time)
+        if self.server_args.trace_level > 0:
+            # For tokenizer, no request stage metrics or request stage logs
+            self._req_time_recorder_init(obj, created_time)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -611,7 +612,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        trace_slice_end(RequestStage.TOKENIZE, obj.rid)
+        global_get_time_recorder(obj.rid).metric_trace_slice_end(RequestStage.TOKENIZE)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -804,7 +805,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
-            trace_slice_end(RequestStage.TOKENIZE, req.rid)
+            global_get_time_recorder(req.rid).metric_trace_slice_end(
+                RequestStage.TOKENIZE
+            )
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -856,13 +859,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
-        tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+        time_recorder = global_get_time_recorder(obj.rid)
+        time_recorder.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
+        tokenized_obj.time_recorder = time_recorder.trace_get_proc_propagate_context()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
-        trace_slice_end(
-            RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
+        time_recorder.metric_trace_slice_end(
+            RequestStage.TOKENIZER_DISPATCH, thread_finish_flag=True
         )
         return state
 
@@ -880,6 +884,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+        if self.server_args.trace_level > 0:
+            for tokenized_obj in tokenized_objs:
+                time_recorder = global_get_time_recorder(tokenized_obj.rid)
+                time_recorder.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
+                tokenized_obj.time_recorder = (
+                    time_recorder.trace_get_proc_propagate_context()
+                )
+
         self.send_to_scheduler.send_pyobj(batch_req)
 
         # Create states for each individual request in the batch
@@ -889,6 +901,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
             self.rid_to_state[tmp_obj.rid] = state
+
+            if self.server_args.trace_level > 0:
+                time_recorder = global_get_time_recorder(tokenized_obj.rid)
+                time_recorder.metric_trace_slice_end(RequestStage.TOKENIZER_DISPATCH)
 
     async def _wait_one_response(
         self,
@@ -1434,7 +1450,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
-                trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+                time_recorder = global_get_time_recorder(rid)
+                time_recorder.trace_req_finish(ts=int(state.finished_time * 1e9))
+                gloabl_del_timer_recorder(rid)
 
                 del self.rid_to_state[rid]
 
@@ -2087,7 +2105,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
             self.send_to_scheduler.send_pyobj(load_udpate_req)
 
-    def _trace_request_start(
+    def _req_time_recorder_init(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
@@ -2096,13 +2114,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
             )
-            trace_req_start(
-                obj.rid,
-                bootstrap_room,
+            time_recorder = RequestTimeRecorder(
+                rid=obj.rid,
+                bootstrap_room=bootstrap_room,
+                module_name="request",
+                server_args=self.server_args,
                 ts=int(created_time * 1e9),
-                role=self.server_args.disaggregation_mode,
             )
-            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
+            # store into global table,
+            # because time_recorder can not be passed to _handle_batch_output
+            global_set_time_recorder(time_recorder)
+            time_recorder.metric_trace_slice_start(
+                RequestStage.ANONYMOUS, ts=int(created_time * 1e9)
+            )
         else:
             for i in range(len(obj.rid)):
                 bootstrap_room = (
@@ -2110,14 +2134,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
                     else None
                 )
-                trace_req_start(
-                    obj.rid[i],
-                    bootstrap_room,
+                time_recorder = RequestTimeRecorder(
+                    rid=obj.rid[i],
+                    bootstrap_room=bootstrap_room,
+                    module_name="request",
+                    server_args=self.server_args,
                     ts=int(created_time * 1e9),
-                    role=self.server_args.disaggregation_mode,
                 )
-                trace_slice_start(
-                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
+                global_set_time_recorder(time_recorder)
+                time_recorder.metric_trace_slice_start(
+                    RequestStage.ANONYMOUS,
+                    ts=int(created_time * 1e9),
                 )
 
 

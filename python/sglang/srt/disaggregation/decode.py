@@ -47,7 +47,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -58,10 +58,10 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.tracing.trace import (
+from sglang.srt.tracing.req_time_recorder import (
+    RequestStage,
+    metric_trace_slice_batch,
     trace_event_batch,
-    trace_slice_batch,
-    trace_slice_end,
 )
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -317,8 +317,9 @@ class DecodePreallocQueue:
                 prefill_dp_rank=req.data_parallel_rank,
             )
 
-            req.add_latency(RequestStage.DECODE_PREPARE)
-            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
+            req.time_recorder.metric_trace_slice_end(
+                RequestStage.DECODE_PREPARE, auto_next_anon=True
+            )
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -527,15 +528,11 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
-            decode_req.req.time_stats.decode_transfer_queue_entry_time = (
-                time.perf_counter()
-            )
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
-            trace_slice_end(
-                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
+
+            decode_req.req.time_recorder.metric_trace_slice_end(
+                RequestStage.DECODE_BOOTSTRAP, auto_next_anon=True
             )
 
         self.queue = [
@@ -772,29 +769,24 @@ class DecodeTransferQueue:
                 decode_req.kv_receiver = None
 
                 indices_to_remove.add(i)
-                decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+                decode_req.req.wait_queue_entry_time = time.perf_counter()
 
                 # special handling for sampling_params.max_new_tokens == 1
                 if decode_req.req.sampling_params.max_new_tokens == 1:
                     # finish immediately
-                    decode_req.req.time_stats.forward_entry_time = (
-                        decode_req.req.time_stats.completion_time
-                    ) = time.perf_counter()
                     decode_req.req.check_finished()
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )
                     self.tree_cache.cache_finished_req(decode_req.req)
-                    trace_slice_end(
+                    decode_req.req.time_recorder.metric_trace_slice_end(
                         RequestStage.DECODE_QUICK_FINISH,
-                        decode_req.req.rid,
                         thread_finish_flag=True,
                     )
                 else:
                     transferred_reqs.append(decode_req.req)
-                    trace_slice_end(
+                    decode_req.req.time_recorder.metric_trace_slice_end(
                         RequestStage.DECODE_TRANSFERRED,
-                        decode_req.req.rid,
                         auto_next_anon=True,
                     )
 
@@ -810,7 +802,6 @@ class DecodeTransferQueue:
         for i in indices_to_remove:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
-            self.queue[i].req.add_latency(RequestStage.DECODE_TRANSFERRED)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -843,7 +834,9 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
+                    metric_trace_slice_batch(
+                        RequestStage.DECODE_FAKE_OUTPUT, batch.reqs
+                    )
                     if prepare_mlp_sync_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
@@ -893,7 +886,9 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
+                    metric_trace_slice_batch(
+                        RequestStage.DECODE_FAKE_OUTPUT, batch.reqs
+                    )
                     if prepare_mlp_sync_flag:
                         batch_, batch_result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
@@ -1004,7 +999,9 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                req.add_latency(RequestStage.DECODE_WAITING)
+                req.time_recorder.metric_trace_slice_end(
+                    RequestStage.DECODE_WAITING, auto_next_anon=True
+                )
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)
@@ -1012,9 +1009,6 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
-
-        for req in can_run_list:
-            req.time_stats.forward_entry_time = time.perf_counter()
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

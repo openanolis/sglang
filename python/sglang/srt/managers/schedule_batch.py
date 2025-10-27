@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import enum
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,7 +35,6 @@ import copy
 import dataclasses
 import logging
 import re
-import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
@@ -69,11 +66,12 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.tracing.req_time_recorder import NoOpTimeRecorder, RequestTimeRecorder
 from sglang.srt.utils import flatten_nested_list
 
 if TYPE_CHECKING:
@@ -391,35 +389,6 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
-class RequestStage(str, enum.Enum):
-    # Tokenizer
-    TOKENIZE = "tokenize"
-    TOKENIZER_DISPATCH = "dispatch"
-
-    # DP controller
-    DC_DISPATCH = "dc_dispatch"
-
-    # common/non-disaggregation
-    PREFILL_WAITING = "prefill_waiting"
-    REQUEST_PROCESS = "request_process"
-    DECODE_LOOP = "decode_loop"
-    PREFILL_FORWARD = "prefill_forward"
-    PREFILL_CHUNKED_FORWARD = "chunked_prefill"
-
-    # disaggregation prefill
-    PREFILL_PREPARE = "prefill_prepare"
-    PREFILL_BOOTSTRAP = "prefill_bootstrap"
-    PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
-
-    # disaggregation decode
-    DECODE_PREPARE = "decode_prepare"
-    DECODE_BOOTSTRAP = "decode_bootstrap"
-    DECODE_WAITING = "decode_waiting"
-    DECODE_TRANSFERRED = "decode_transferred"
-    DECODE_FAKE_OUTPUT = "fake_output"
-    DECODE_QUICK_FINISH = "quick_finish"
-
-
 class Req:
     """The input and output status of a request."""
 
@@ -451,6 +420,7 @@ class Req:
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         http_worker_ipc: Optional[str] = None,
+        time_recorder: Optional[RequestTimeRecorder] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -630,11 +600,14 @@ class Req:
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
-        # For metrics
+        # For metrics, trace or log print
         self.metrics_collector = metrics_collector
-        self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
+        self.time_recorder = time_recorder if time_recorder else NoOpTimeRecorder()
         self.has_log_time_stats: bool = False
-        self.last_tic = time.monotonic()
+
+        # For schedule policy
+        self.wait_queue_entry_time: float = 0
+        self.forward_scheduled: bool = False
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -676,16 +649,6 @@ class Req:
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
         return self.output_ids
-
-    def add_latency(self, stage: RequestStage):
-        if self.metrics_collector is None:
-            return
-
-        now = time.monotonic()
-        self.metrics_collector.observe_per_stage_req_latency(
-            stage.value, now - self.last_tic
-        )
-        self.last_tic = now
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -919,10 +882,10 @@ class Req:
             return
 
         if self.bootstrap_room is not None:
-            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
+            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_recorder.disagg_mode_str()})"
         else:
-            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
-        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
+            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_recorder.disagg_mode_str()})"
+        logger.info(f"{prefix}: {self.time_recorder.convert_to_duration()}")
         self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):

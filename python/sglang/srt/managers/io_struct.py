@@ -27,6 +27,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.tracing.req_time_recorder import RequestTimeRecorder
 from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
@@ -643,6 +644,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # For observability
+    time_recorder: Optional[Union[RequestTimeRecorder, Dict]] = None
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
@@ -691,9 +695,6 @@ class EmbeddingReqInput(BaseReq):
 
     # For background responses (OpenAI responses API)
     background: bool = False
-
-    # tracing context
-    trace_context: Optional[Dict] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -791,6 +792,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     data_parallel_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
+    # For observability
+    time_recorder: Optional[Union[RequestTimeRecorder, Dict]] = None
 
 
 @dataclass

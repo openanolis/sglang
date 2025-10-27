@@ -34,21 +34,15 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req, RequestStage
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
 )
-from sglang.srt.tracing.trace import (
-    process_tracing_init,
-    trace_get_proc_propagate_context,
-    trace_set_proc_propagate_context,
-    trace_set_thread_info,
-    trace_slice_end,
-    trace_slice_start,
-)
+from sglang.srt.tracing.req_time_recorder import RequestStage, RequestTimeRecorder
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
@@ -179,15 +173,23 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def dispatching_with_trace(self, req: Req):
-        if self.server_args.enable_trace:
-            trace_set_proc_propagate_context(req.rid, req.trace_context)
-            trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
-            req.trace_context = trace_get_proc_propagate_context(req.rid)
+        if self.server_args.trace_level > 0:
+            time_recorder = RequestTimeRecorder(
+                req.rid,
+                bootstrap_room=req.bootstrap_room,
+                module_name="request",
+                server_args=self.server_args,
+                propagation_context=req.time_recorder,
+            )
+            time_recorder.metric_trace_slice_start(RequestStage.DC_DISPATCH)
+            req.time_recorder = time_recorder.trace_get_proc_propagate_context()
 
         self.dispatching(req)
 
-        if self.server_args.enable_trace:
-            trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
+        if self.server_args.trace_level > 0:
+            time_recorder.metric_trace_slice_end(
+                RequestStage.DC_DISPATCH, thread_finish_flag=True
+            )
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -506,7 +508,7 @@ def run_data_parallel_controller_process(
     pipe_writer,
 ):
     kill_itself_when_parent_died()
-    if server_args.enable_trace:
+    if server_args.trace_level > 0:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":

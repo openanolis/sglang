@@ -38,7 +38,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             router_args = args
 
         if router_args.mini_lb:
-            if router_args.enable_trace:
+            if router_args.trace_level > 0:
                 from sglang.srt.tracing.trace import (
                     process_tracing_init,
                     trace_set_thread_info,
@@ -51,7 +51,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             mini_lb.start()
         else:
             # TODO: support tracing for router(Rust).
-            del router_args.enable_trace
+            del router_args.trace_level
+            del router_args.trace_module
             del router_args.otlp_traces_endpoint
 
             if Router is None:
