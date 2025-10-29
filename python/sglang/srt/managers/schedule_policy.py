@@ -61,6 +61,7 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 CFS_MAX_WEIGHT = 1_000_000.0
+DEFAULT_CFS_WEIGHT = 1024
 
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
@@ -74,6 +75,7 @@ class CacheAgnosticPolicy(Enum):
 
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
+    CFS = "cfs" # completely fair scheduler
     RANDOM = "random"
 
 
@@ -93,6 +95,7 @@ class SchedulePolicy:
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+        self.total_weight: int = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(
@@ -135,6 +138,9 @@ class SchedulePolicy:
                     self.enable_priority_scheduling,
                     self.schedule_low_priority_values_first,
                 )
+            elif policy == CacheAgnosticPolicy.CFS:
+                #SchedulePolicy._sort_by_cfs() dtcccc
+                pass
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
             else:
@@ -212,6 +218,13 @@ class SchedulePolicy:
                         torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
         return temporary_deprioritized
+
+    def update_vruntime(self, batch: ScheduleBatch, runtime: float) -> None:
+        if self.policy == CacheAgnosticPolicy.CFS:
+            runtime = int(runtime * 1e9) # convert to nanoseconds
+            total_weight = self.total_weight
+            for req in batch.reqs:
+                req.vruntime += runtime * DEFAULT_CFS_WEIGHT // req.weight
 
     @staticmethod
     def _sort_by_longest_prefix(

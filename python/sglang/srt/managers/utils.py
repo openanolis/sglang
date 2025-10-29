@@ -44,6 +44,10 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # For forward time accounting in CFS scheduler
+    start_time: float = 0.0
+    end_time: float = 0.0
+
     def copy_to_cpu(self, return_logprob: bool = False):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,

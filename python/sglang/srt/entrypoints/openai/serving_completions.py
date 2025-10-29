@@ -120,6 +120,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
+            weight=request.weight,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
         )

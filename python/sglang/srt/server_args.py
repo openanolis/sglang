@@ -1829,7 +1829,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
+            choices=["lpm", "random", "fcfs", "cfs", "dfs-weight", "lof", "priority"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -3415,6 +3415,9 @@ class ServerArgs:
                 "fcfs",
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+
+        if self.schedule_policy == "cfs":
+            assert self.max_queued_requests is None, "Completely fair scheduler should not have limit on max_queued_requests."
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:

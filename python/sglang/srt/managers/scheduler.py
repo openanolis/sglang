@@ -2026,6 +2026,7 @@ class Scheduler(
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
+            start_time = time.perf_counter()
             if self.enable_overlap:
                 # FIXME: remove this assert
                 assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
@@ -2108,6 +2109,7 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
+            batch_result.start_time = start_time
             return batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
@@ -2149,6 +2151,9 @@ class Scheduler(
             if self.enable_overlap:
                 if result.copy_done is not None:
                     result.copy_done.synchronize()
+
+        if isinstance(result, GenerationBatchResult):
+            self.policy.update_vruntime(batch, time.perf_counter() - result.start_time)
 
         self.maybe_send_health_check_signal()
 
