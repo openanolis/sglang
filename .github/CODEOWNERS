@@ -29,5 +29,7 @@
 /sgl-router/src/routers/http/openai_router.rs @key4ng
 /sgl-router/src/data_connector @key4ng
 /sgl-router/src/mcp @key4ng
+/sgl-router/src/wasm @tonyluj
+/sgl-router/examples/wasm @tonyluj
 /test/srt/test_modelopt* @Edwardf0t1
 /test/srt/ascend @ping1jing2
