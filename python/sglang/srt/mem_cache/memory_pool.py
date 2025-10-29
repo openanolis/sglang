@@ -459,11 +459,14 @@ class MHATokenToKVPool(KVCache):
 
         # for disagg with nvlink
         custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
-        self.enable_custom_mem_pool = (
-            custom_mem_pool_type in ["NVLINK", "BAREX"]
-            if custom_mem_pool_type is not None
-            else False
-        )
+        if custom_mem_pool_type is not None:
+            # Handle boolean True as NVLINK
+            if custom_mem_pool_type.lower() == "true":
+                custom_mem_pool_type = "NVLINK"
+            self.enable_custom_mem_pool = custom_mem_pool_type in ["NVLINK", "BAREX"]
+        else:
+            self.enable_custom_mem_pool = False
+        
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
             if custom_mem_pool_type == "NVLINK":
@@ -1169,11 +1172,14 @@ class MLATokenToKVPool(KVCache):
 
         # for disagg with nvlink
         custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
-        self.enable_custom_mem_pool = (
-            custom_mem_pool_type in ["NVLINK", "BAREX"]
-            if custom_mem_pool_type is not None
-            else False
-        )
+        if custom_mem_pool_type is not None:
+            # Handle boolean True as NVLINK
+            if custom_mem_pool_type.lower() == "true":
+                custom_mem_pool_type = "NVLINK"
+            self.enable_custom_mem_pool = custom_mem_pool_type in ["NVLINK", "BAREX"]
+        else:
+            self.enable_custom_mem_pool = False
+        
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
             if custom_mem_pool_type == "NVLINK":
