@@ -55,6 +55,8 @@ use crate::{
         traits::Tokenizer,
     },
     tool_parser::ParserFactory as ToolParserFactory,
+    wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
+    wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
 };
 
 //
@@ -78,6 +80,7 @@ pub struct AppContext {
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
     pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
+    pub wasm_manager: Option<Arc<WasmModuleManager>>,
 }
 
 impl AppContext {
@@ -97,6 +100,7 @@ impl AppContext {
         load_monitor: Option<Arc<LoadMonitor>>,
         worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
         workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
+        wasm_manager: Option<Arc<WasmModuleManager>>,
     ) -> Self {
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
@@ -119,6 +123,7 @@ impl AppContext {
             configured_tool_parser,
             worker_job_queue,
             workflow_engine,
+            wasm_manager,
         }
     }
 }
@@ -749,6 +754,10 @@ pub fn build_app(
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::wasm_middleware,
         ));
 
     let public_routes = Router::new()
@@ -766,6 +775,9 @@ pub fn build_app(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/wasm", post(add_wasm_module))
+        .route("/wasm/{module_uuid}", delete(remove_wasm_module))
+        .route("/wasm", get(list_wasm_modules))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -985,6 +997,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Create empty OnceLock for worker job queue and workflow engine (will be initialized below)
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
+    // TODO: initialize wasm manager with config
+    let wasm_manager = Some(Arc::new(WasmModuleManager::new(WasmRuntimeConfig::default()).unwrap()));
 
     // Create AppContext with all initialized components
     let app_context = AppContext::new(
@@ -1002,6 +1016,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         load_monitor,
         worker_job_queue,
         workflow_engine,
+        wasm_manager,
     );
 
     let app_context = Arc::new(app_context);
