@@ -31,6 +31,8 @@ use crate::{
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
+    ha_run,
+    ha::service::HAServerConfig,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -524,6 +526,7 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    pub ha_server_config: Option<HAServerConfig>,
 }
 
 pub fn build_app(
@@ -686,6 +689,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(prometheus_config) = &config.prometheus_config {
         metrics::start_prometheus(prometheus_config.clone());
     }
+
+    let ha_handler = if let Some(ha_server_config) = &config.ha_server_config {
+        Some(ha_run!(
+            ha_server_config.self_name,
+            ha_server_config.self_addr,
+            ha_server_config.init_peer
+        ))
+    } else {
+        None
+    };
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
@@ -930,6 +943,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    }
+
+    if let Some(mut ha_handler) = ha_handler {
+        info!("Shutting down HA server");
+        ha_handler.shutdown();
     }
 
     Ok(())

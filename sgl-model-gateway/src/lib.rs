@@ -18,3 +18,4 @@ pub mod tool_parser;
 pub mod version;
 pub mod wasm;
 pub mod workflow;
+pub mod ha;
