@@ -55,8 +55,11 @@ use crate::{
         traits::Tokenizer,
     },
     tool_parser::ParserFactory as ToolParserFactory,
-    wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
+    wasm::{
+        config::WasmRuntimeConfig,
+        module_manager::WasmModuleManager,
+        route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
+    },
 };
 
 //
@@ -998,7 +1001,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
     // TODO: initialize wasm manager with config
-    let wasm_manager = Some(Arc::new(WasmModuleManager::new(WasmRuntimeConfig::default()).unwrap()));
+    let wasm_manager = Some(Arc::new(
+        WasmModuleManager::new(WasmRuntimeConfig::default()).unwrap(),
+    ));
 
     // Create AppContext with all initialized components
     let app_context = AppContext::new(

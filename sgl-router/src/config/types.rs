@@ -84,6 +84,9 @@ pub struct RouterConfig {
     /// Tokenizer cache configuration
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    /// Enable WASM support
+    #[serde(default)]
+    pub enable_wasm: bool,
 }
 
 /// Tokenizer cache configuration
@@ -507,6 +510,7 @@ impl Default for RouterConfig {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            enable_wasm: false,
         }
     }
 }

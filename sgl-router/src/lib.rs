@@ -208,6 +208,7 @@ struct Router {
     backend: BackendType,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
+    enable_wasm: bool,
 }
 
 impl Router {
@@ -361,6 +362,7 @@ impl Router {
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             },
+            enable_wasm: self.enable_wasm,
         })
     }
 }
@@ -435,6 +437,7 @@ impl Router {
         backend = BackendType::Sglang,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
+        enable_wasm = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -504,6 +507,7 @@ impl Router {
         backend: BackendType,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
+        enable_wasm: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -587,6 +591,7 @@ impl Router {
             backend,
             history_backend,
             oracle_config,
+            enable_wasm,
         })
     }
 
