@@ -75,6 +75,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
+from sglang.srt.managers.schedule_policy import DEFAULT_CFS_WEIGHT
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -505,7 +506,8 @@ class Req:
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
-        self.weight = weight
+        self.weight: int = weight or DEFAULT_CFS_WEIGHT
+        self.vruntime: int = 0
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -647,8 +649,6 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
-        self.weight: int = 0
-        self.vruntime: int = 0
 
     @property
     def seqlen(self):

@@ -228,6 +228,7 @@ class ServerArgs:
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
+    vruntime_scheduling_preemption_threshold: int = 10_000_000 # 10ms for default weight (1024)
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
@@ -1855,6 +1856,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.priority_scheduling_preemption_threshold,
             help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+        )
+        parser.add_argument(
+            "--vruntime-scheduling-preemption-threshold",
+            type=int,
+            default=ServerArgs.vruntime_scheduling_preemption_threshold,
+            help="Minimum difference in vruntime for an incoming/waiting request to have to preempt running request(s).",
         )
         parser.add_argument(
             "--schedule-conservativeness",

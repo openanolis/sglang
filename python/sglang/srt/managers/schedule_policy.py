@@ -139,8 +139,7 @@ class SchedulePolicy:
                     self.schedule_low_priority_values_first,
                 )
             elif policy == CacheAgnosticPolicy.CFS:
-                #SchedulePolicy._sort_by_cfs() dtcccc
-                pass
+                SchedulePolicy._sort_by_cfs(waiting_queue)
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
             else:
@@ -281,6 +280,13 @@ class SchedulePolicy:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
 
     @staticmethod
+    def _sort_by_cfs(waiting_queue: List[Req]) -> None:
+        """Sorts the waiting queue based on the vruntime."""
+        waiting_queue.sort(
+            key=lambda x: (x.vruntime)
+        )
+
+    @staticmethod
     def _sort_randomly(waiting_queue: List[Req]) -> None:
         """Shuffles the waiting queue randomly."""
         random.shuffle(waiting_queue)
@@ -340,6 +346,7 @@ class ScheduleCFS():
             return CFS_MAX_WEIGHT/prio
 
     def vruntime_award(prio: int):
+        pass
     
     def calc_total_weight(self):
         with self.lock.read_acquire():
@@ -419,16 +426,19 @@ class PrefillAdder:
         tree_cache: BasePrefixCache,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         running_batch: ScheduleBatch,
+        policy: SchedulePolicy,
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        vruntime_scheduling_preemption_threshold: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
+        self.policy = policy
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
@@ -461,6 +471,9 @@ class PrefillAdder:
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
+        )
+        self.vruntime_scheduling_preemption_threshold = (
+            vruntime_scheduling_preemption_threshold
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
@@ -755,16 +768,23 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
-        if server_args.schedule_low_priority_values_first:
+        if self.policy.policy in [CacheAgnosticPolicy.FCFS, CacheAgnosticPolicy.LOF]:
+            if server_args.schedule_low_priority_values_first:
+                sorted_running_reqs = sorted(
+                    self.running_batch.reqs,
+                    key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
+                )
+            else:
+                sorted_running_reqs = sorted(
+                    self.running_batch.reqs,
+                    key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
+                )
+        else: #CFS
             sorted_running_reqs = sorted(
                 self.running_batch.reqs,
-                key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
+                key=lambda x: (-x.vruntime, -x.time_stats.wait_queue_entry_time),
             )
-        else:
-            sorted_running_reqs = sorted(
-                self.running_batch.reqs,
-                key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
-            )
+
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
@@ -774,15 +794,25 @@ class PrefillAdder:
         for running_req in sorted_running_reqs:
             if running_req in self.preempt_list:
                 continue
-            # Priority difference needs to meet the threshold to be preemptible.
-            priority_diff = req.priority - running_req.priority
-            if server_args.schedule_low_priority_values_first:
-                priority_diff *= -1
-            if priority_diff > self.priority_scheduling_preemption_threshold:
+            do_kick = False
+            if self.policy.policy in [CacheAgnosticPolicy.FCFS, CacheAgnosticPolicy.LOF]:
+                # Priority difference needs to meet the threshold to be preemptible.
+                priority_diff = req.priority - running_req.priority
+                if server_args.schedule_low_priority_values_first:
+                    priority_diff *= -1
+                if priority_diff > self.priority_scheduling_preemption_threshold:
+                    do_kick = True
+            else: #CFS
+                vruntime_diff = running_req.vruntime - req.vruntime
+                if vruntime_diff > self.vruntime_scheduling_preemption_threshold:
+                    do_kick = True
+            if do_kick:
                 preemptible_reqs.append(running_req)
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req
                 )
+                if min_tokens_to_remove <= 0:
+                    break
 
         # Check max token count limit can be met
         if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:

@@ -242,6 +242,9 @@ class Scheduler(
         self.priority_scheduling_preemption_threshold = (
             server_args.priority_scheduling_preemption_threshold
         )
+        self.vruntime_scheduling_preemption_threshold = (
+            server_args.vruntime_scheduling_preemption_threshold
+        )
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -437,7 +440,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         # Enable preemption for priority scheduling.
-        self.try_preemption = self.enable_priority_scheduling
+        self.try_preemption = self.enable_priority_scheduling or self.schedule_policy == "cfs"
 
         assert (
             server_args.schedule_conservativeness >= 0
@@ -1813,11 +1816,13 @@ class Scheduler(
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
+            self.policy,
             self.new_token_ratio,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            self.vruntime_scheduling_preemption_threshold,
         )
 
         if self.chunked_req is not None:
