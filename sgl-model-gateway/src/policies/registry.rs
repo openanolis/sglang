@@ -1,7 +1,10 @@
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use serde_json;
 use tracing::{debug, info, warn};
+
+use crate::ha::OptionalHASyncManager;
 
 /// Policy Registry for managing model-to-policy mappings
 ///
@@ -32,6 +35,9 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
+    /// Optional HA sync manager for state synchronization
+    ha_sync: OptionalHASyncManager,
 }
 
 impl PolicyRegistry {
@@ -45,7 +51,27 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
+            ha_sync: None,
         }
+    }
+
+    /// Create a new PolicyRegistry with HA sync manager
+    pub fn with_ha_sync(default_policy_config: PolicyConfig, ha_sync: OptionalHASyncManager) -> Self {
+        let default_policy = Self::create_policy_from_config(&default_policy_config);
+
+        Self {
+            model_policies: Arc::new(DashMap::new()),
+            model_worker_counts: Arc::new(DashMap::new()),
+            default_policy,
+            prefill_policy: Arc::new(OnceLock::new()),
+            decode_policy: Arc::new(OnceLock::new()),
+            ha_sync,
+        }
+    }
+
+    /// Set HA sync manager
+    pub fn set_ha_sync(&mut self, ha_sync: OptionalHASyncManager) {
+        self.ha_sync = ha_sync;
     }
 
     /// Called when a worker is added
@@ -87,6 +113,17 @@ impl PolicyRegistry {
         self.model_policies
             .insert(model_id.to_string(), Arc::clone(&policy));
 
+        // Sync to HA if enabled
+        if let Some(ref ha_sync) = self.ha_sync {
+            // Serialize policy config (simplified - just store policy name for now)
+            let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
+            ha_sync.sync_policy_state(
+                model_id.to_string(),
+                policy.name().to_string(),
+                config,
+            );
+        }
+
         policy
     }
 
@@ -123,6 +160,11 @@ impl PolicyRegistry {
                     policy.name(),
                     model_id
                 );
+            }
+
+            // Sync removal to HA if enabled
+            if let Some(ref ha_sync) = self.ha_sync {
+                ha_sync.remove_policy_state(model_id);
             }
         }
     }
