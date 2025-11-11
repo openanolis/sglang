@@ -6,7 +6,6 @@ pub mod core;
 pub mod data_connector;
 pub mod grpc_client;
 pub mod ha;
-pub mod ha;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
