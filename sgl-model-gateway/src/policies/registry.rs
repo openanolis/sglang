@@ -4,8 +4,6 @@ use dashmap::DashMap;
 use serde_json;
 use tracing::{debug, info, warn};
 
-use crate::ha::OptionalHASyncManager;
-
 /// Policy Registry for managing model-to-policy mappings
 ///
 /// This registry manages the dynamic assignment of load balancing policies to models.
@@ -16,7 +14,7 @@ use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
     ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
-use crate::{config::types::PolicyConfig, core::Worker};
+use crate::{config::types::PolicyConfig, core::Worker, ha::OptionalHASyncManager};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -56,7 +54,10 @@ impl PolicyRegistry {
     }
 
     /// Create a new PolicyRegistry with HA sync manager
-    pub fn with_ha_sync(default_policy_config: PolicyConfig, ha_sync: OptionalHASyncManager) -> Self {
+    pub fn with_ha_sync(
+        default_policy_config: PolicyConfig,
+        ha_sync: OptionalHASyncManager,
+    ) -> Self {
         let default_policy = Self::create_policy_from_config(&default_policy_config);
 
         Self {
@@ -117,11 +118,7 @@ impl PolicyRegistry {
         if let Some(ref ha_sync) = self.ha_sync {
             // Serialize policy config (simplified - just store policy name for now)
             let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
-            ha_sync.sync_policy_state(
-                model_id.to_string(),
-                policy.name().to_string(),
-                config,
-            );
+            ha_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
         }
 
         policy

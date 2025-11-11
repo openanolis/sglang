@@ -10,9 +10,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use parking_lot::RwLock;
-
 use crdts::{CvRDT, PNCounter};
+use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// State key for CRDT maps
@@ -43,8 +42,7 @@ impl From<&str> for SKey {
 
 /// Last-Write-Wins Register wrapper
 /// Simplified implementation using timestamp and version
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(bound(serialize = "T: Serialize"))]
 #[derive(serde::Deserialize)]
 #[serde(bound(deserialize = "T: DeserializeOwned"))]
@@ -99,8 +97,7 @@ impl<T: Clone + Serialize + DeserializeOwned> LWWRegister<T> {
 
 /// CRDT Map wrapper using LWWRegister for values
 /// Simplified implementation using BTreeMap with LWWRegister values
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(bound(serialize = "T: Serialize + DeserializeOwned"))]
 #[derive(serde::Deserialize)]
 #[serde(bound(deserialize = "T: DeserializeOwned"))]
@@ -313,5 +310,3 @@ impl SyncPNCounter {
         self.inner.read().clone()
     }
 }
-
-
