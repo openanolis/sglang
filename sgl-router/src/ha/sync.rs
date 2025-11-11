@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     crdt::SKey,
-    stores::{StateStores, WorkerState, PolicyState, StoreType},
+    stores::{PolicyState, StateStores, StoreType, WorkerState},
 };
 
 /// HA sync manager for coordinating state synchronization
@@ -56,12 +56,7 @@ impl HASyncManager {
     }
 
     /// Sync policy state to HA stores
-    pub fn sync_policy_state(
-        &self,
-        model_id: String,
-        policy_type: String,
-        config: Vec<u8>,
-    ) {
+    pub fn sync_policy_state(&self, model_id: String, policy_type: String, config: Vec<u8>) {
         let key = SKey::new(format!("policy:{}", model_id));
         let state = PolicyState {
             model_id: model_id.clone(),
@@ -123,4 +118,3 @@ impl HASyncManager {
 
 /// Optional HA sync manager (can be None if HA is not enabled)
 pub type OptionalHASyncManager = Option<Arc<HASyncManager>>;
-

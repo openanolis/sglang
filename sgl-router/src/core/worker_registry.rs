@@ -7,8 +7,10 @@ use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
-use crate::ha::OptionalHASyncManager;
+use crate::{
+    core::{ConnectionMode, Worker, WorkerType},
+    ha::OptionalHASyncManager,
+};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -248,7 +250,7 @@ impl WorkerRegistry {
         if let Some(worker) = self.workers.get(worker_id) {
             // Update worker health (if Worker trait has a method for this)
             // For now, we'll just sync to HA
-            
+
             // Sync to HA if enabled
             if let Some(ref ha_sync) = self.ha_sync {
                 ha_sync.sync_worker_state(
