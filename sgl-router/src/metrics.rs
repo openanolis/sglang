@@ -22,6 +22,8 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
+    // Initialize HA metrics
+    crate::ha::metrics::init_ha_metrics();
     describe_counter!(
         "sgl_router_requests_total",
         "Total number of requests by route and method"
