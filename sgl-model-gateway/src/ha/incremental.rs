@@ -3,19 +3,17 @@
 //! Collects local state changes and batches them for efficient transmission
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 use super::{
-    crdt::SKey,
     gossip::StateUpdate,
-    stores::{AppState, PolicyState, StateStores, StoreType, WorkerState},
+    stores::{StateStores, StoreType},
 };
 
 /// Tracks the last sent version for each key in each store
@@ -58,7 +56,7 @@ impl IncrementalUpdateCollector {
                         .worker
                         .get_metadata(&key)
                         .map(|(v, _)| v)
-                        .unwrap_or(0);
+                        .unwrap_or_default();
 
                     let last_sent_version = last_sent.worker.get(&key_str).copied().unwrap_or(0);
 

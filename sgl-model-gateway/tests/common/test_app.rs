@@ -89,6 +89,8 @@ pub fn create_test_app(
         context: app_context,
         concurrency_queue_tx: None,
         router_manager: None,
+        ha_handler: None,
+        ha_sync_manager: None,
     });
 
     // Configure request ID headers (use defaults if not specified)

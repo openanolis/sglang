@@ -4,12 +4,11 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use super::{
     crdt::SKey,
-    stores::{PolicyState, StateStores, StoreType, WorkerState},
+    stores::{PolicyState, StateStores, WorkerState},
 };
 
 /// HA sync manager for coordinating state synchronization

@@ -134,10 +134,14 @@ impl MembershipStore {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn all(&self) -> BTreeMap<SKey, MembershipState> {
         self.inner.snapshot().to_map()
     }
-
+    
     pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
         self.inner.get_metadata(key)
     }
@@ -186,10 +190,14 @@ impl AppStore {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn all(&self) -> BTreeMap<SKey, AppState> {
         self.inner.snapshot().to_map()
     }
-
+    
     pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
         self.inner.get_metadata(key)
     }
@@ -238,10 +246,14 @@ impl WorkerStore {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn all(&self) -> BTreeMap<SKey, WorkerState> {
         self.inner.snapshot().to_map()
     }
-
+    
     pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
         self.inner.get_metadata(key)
     }
@@ -290,10 +302,14 @@ impl PolicyStore {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn all(&self) -> BTreeMap<SKey, PolicyState> {
         self.inner.snapshot().to_map()
     }
-
+    
     pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
         self.inner.get_metadata(key)
     }
@@ -319,9 +335,7 @@ impl RateLimitStore {
     }
 
     pub fn get_or_create_counter(&mut self, key: String) -> &mut SyncPNCounter {
-        self.counters
-            .entry(key.clone())
-            .or_insert_with(SyncPNCounter::new)
+        self.counters.entry(key.clone()).or_default()
     }
 
     pub fn get_counter(&self, key: &str) -> Option<&SyncPNCounter> {
