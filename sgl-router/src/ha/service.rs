@@ -23,7 +23,7 @@ use gossip::{
 use crate::ha::{
     controller::HAController,
     node_state_machine::{ConvergenceConfig, NodeStateMachine},
-    partition::{PartitionConfig, PartitionDetector},
+    partition::PartitionDetector,
     ping_server::GossipService,
 };
 

@@ -37,7 +37,6 @@ use crate::{
         service::{HAServerConfig, HAServerHandler},
         sync::HASyncManager,
     },
-    ha_run,
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
     middleware::{self, AuthConfig, QueuedRequest},
@@ -754,7 +753,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let (ha_handler, ha_sync_manager) = if let Some(ha_server_config) = &config.ha_server_config {
         // Create HA sync manager with stores first
-        use crate::ha::{partition::PartitionDetector, stores::StateStores, sync::HASyncManager};
+        use crate::ha::{stores::StateStores, sync::HASyncManager};
         let stores = Arc::new(StateStores::with_self_name(
             ha_server_config.self_name.clone(),
         ));
@@ -763,8 +762,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             ha_server_config.self_name.clone(),
         ));
 
-        // Create partition detector
-        let partition_detector = Arc::new(PartitionDetector::default());
+        // Partition detector is created in HAServerHandler::with_partition_and_state_machine
 
         // Initialize rate-limit hash ring with current membership
         sync_manager.update_rate_limit_membership();
@@ -778,19 +776,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         );
         let (ha_server, handler) = builder.build_with_stores(Some(stores.clone()));
 
-        // Spawn the HA server with stores and partition detector
-        let stores_for_server = stores.clone();
-        let sync_manager_for_server = sync_manager.clone();
-        let partition_detector_for_server = partition_detector.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ha_server
-                .start_serve_with_stores(
-                    Some(stores_for_server),
-                    Some(sync_manager_for_server),
-                    Some(partition_detector_for_server),
-                )
-                .await
-            {
+        // Spawn the HA server
+        spawn(async move {
+            if let Err(e) = ha_server.start_serve().await {
                 tracing::error!("HA server failed: {}", e);
             }
         });
