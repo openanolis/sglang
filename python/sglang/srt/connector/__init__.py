@@ -8,6 +8,7 @@ from sglang.srt.connector.base_connector import (
     BaseFileConnector,
     BaseKVConnector,
 )
+from sglang.srt.connector.mooncake import MooncakeConnector
 from sglang.srt.connector.redis import RedisConnector
 from sglang.srt.connector.remote_instance import RemoteInstanceConnector
 from sglang.srt.connector.s3 import S3Connector
@@ -30,6 +31,8 @@ def create_remote_connector(url, device, **kwargs) -> BaseConnector:
         return S3Connector(url)
     elif connector_type == "instance":
         return RemoteInstanceConnector(url, device)
+    elif connector_type == "mooncake":
+        return MooncakeConnector(url)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
@@ -49,6 +52,7 @@ __all__ = [
     "BaseConnector",
     "BaseFileConnector",
     "BaseKVConnector",
+    "MooncakeConnector",
     "RedisConnector",
     "RemoteInstanceConnector",
     "S3Connector",
