@@ -3,13 +3,12 @@
 //! Manages node lifecycle: NotReady -> Joining -> SnapshotPull -> Converging -> Ready
 
 use std::{
-    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use super::stores::StateStores;
 

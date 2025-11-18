@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{
     consistent_hash::ConsistentHashRing,
@@ -363,18 +363,14 @@ impl RateLimitStore {
     }
 
     /// Get or create counter (only if this node is an owner)
+    #[allow(dead_code)]
     fn get_or_create_counter_internal(&self, key: String) -> Option<SyncPNCounter> {
         if !self.is_owner(&key) {
             return None;
         }
 
         let mut counters = self.counters.write();
-        Some(
-            counters
-                .entry(key.clone())
-                .or_insert_with(SyncPNCounter::new)
-                .clone(),
-        )
+        Some(counters.entry(key.clone()).or_default().clone())
     }
 
     pub fn get_counter(&self, key: &str) -> Option<SyncPNCounter> {
@@ -393,9 +389,7 @@ impl RateLimitStore {
         }
 
         let mut counters = self.counters.write();
-        let counter = counters
-            .entry(key.clone())
-            .or_insert_with(SyncPNCounter::new);
+        let counter = counters.entry(key.clone()).or_default();
         counter.inc(actor, delta);
     }
 
@@ -408,7 +402,7 @@ impl RateLimitStore {
     /// Merge counter from another node (for CRDT synchronization)
     pub fn merge_counter(&self, key: String, other: &SyncPNCounter) {
         let mut counters = self.counters.write();
-        let counter = counters.entry(key).or_insert_with(SyncPNCounter::new);
+        let counter = counters.entry(key).or_default();
         // Get the inner CRDTPNCounter from other SyncPNCounter
         let other_inner = other.snapshot();
         counter.merge(&other_inner);

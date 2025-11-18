@@ -14,7 +14,7 @@ use tracing::instrument;
 
 use super::{
     crdt::SKey,
-    flow_control::{BackpressureController, MessageSizeError, MessageSizeValidator},
+    flow_control::{BackpressureController, MessageSizeValidator},
     gossip::{
         self,
         gossip_server::{Gossip, GossipServer},
@@ -41,6 +41,7 @@ pub struct GossipService {
     stores: Option<Arc<StateStores>>, // Optional state stores for CRDT-based sync
     sync_manager: Option<Arc<HASyncManager>>, // Optional sync manager for applying remote updates
     state_machine: Option<Arc<NodeStateMachine>>,
+    #[allow(dead_code)]
     partition_detector: Option<Arc<PartitionDetector>>,
 }
 
@@ -312,13 +313,13 @@ impl Gossip for GossipService {
         const CHANNEL_CAPACITY: usize = 128;
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<StreamMessage, Status>>(CHANNEL_CAPACITY);
-        let backpressure = BackpressureController::new(CHANNEL_CAPACITY, 25);
+        let _backpressure = BackpressureController::new(CHANNEL_CAPACITY, 25);
         let size_validator = MessageSizeValidator::default();
 
         // Create incremental update collector if stores are available
         let collector = stores.as_ref().map(|stores| {
             Arc::new(IncrementalUpdateCollector::new(
-                Arc::new(stores.clone()),
+                stores.clone(),
                 self_name.clone(),
             ))
         });
@@ -327,7 +328,6 @@ impl Gossip for GossipService {
         if let Some(collector) = collector {
             let tx_incremental = tx.clone();
             let self_name_incremental = self_name.clone();
-            let backpressure_clone = backpressure.clone();
             let size_validator_clone = size_validator.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5)); // Send every 5 seconds
@@ -596,6 +596,8 @@ impl Gossip for GossipService {
                                         self_name: self_name.clone(),
                                         stores: stores.clone(),
                                         sync_manager: sync_manager.clone(),
+                                        state_machine: None,
+                                        partition_detector: None,
                                     };
                                     let chunks =
                                         service.create_snapshot_chunks(store_type, 100).await; // chunk_size = 100 entries
