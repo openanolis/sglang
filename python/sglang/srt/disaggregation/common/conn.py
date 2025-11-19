@@ -127,6 +127,7 @@ class CommonKVManager(BaseKVManager):
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
+            "bootstrap_room": -1,
         }
 
         try:
@@ -194,6 +195,39 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        self._register_bootstrap_info()
+
+    def _register_bootstrap_info(self):
+        """Register bootstrap info to bootstrap server via HTTP POST."""
+
+        url = f"http://{self.bootstrap_server_url}/route"
+        payload = {
+            "role": "Prefill",
+            "attn_tp_size": self.kv_mgr.attn_tp_size,
+            "attn_tp_rank": self.kv_mgr.attn_tp_rank,
+            "attn_dp_size": self.kv_mgr.attn_dp_size,
+            "attn_dp_rank": self.kv_mgr.attn_dp_rank,
+            "pp_size": self.kv_mgr.pp_size,
+            "pp_rank": self.kv_mgr.pp_rank,
+            "system_dp_size": self.kv_mgr.system_dp_size,
+            "system_dp_rank": self.kv_mgr.system_dp_rank,
+            "rank_ip": self.kv_mgr.local_ip,
+            "rank_port": self.kv_mgr.rank_port,
+            "bootstrap_room": self.bootstrap_room,
+        }
+
+        try:
+            response = requests.put(url, json=payload, timeout=5)
+            if response.status_code == 200:
+                logger.debug("Prefill successfully registered to bootstrap server.")
+            else:
+                logger.error(
+                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Prefill instance failed to register to bootstrap server: {e}"
+            )
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
@@ -383,6 +417,7 @@ class CommonKVReceiver(BaseKVReceiver):
         else:
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
+        logger.debug(f"{self.bootstrap_infos=}")
         assert len(self.bootstrap_infos) > 0
 
     def _get_bootstrap_info_from_server(
@@ -390,7 +425,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={-1}&engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -409,7 +444,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
+            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={-1}&engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
             response = requests.get(url)
             if response.status_code == 200:
                 prefill_parallel_info = response.json()
@@ -426,6 +461,23 @@ class CommonKVReceiver(BaseKVReceiver):
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
             return None, None, None
+
+    def _get_bootstrap_room_from_server(self, bootstrap_room):
+        """Fetch the bootstrap dp rank info from the bootstrap server."""
+        try:
+            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={bootstrap_room}&engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                bootstrap_table = response.json()
+                return bootstrap_table
+            else:
+                logger.error(
+                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                )
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching prefill info from bootstrap: {e}")
+            return None
 
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
@@ -470,6 +522,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
         ] = {}
+        self.prefill_dp_rank_table: Dict[int, Dict[str], Union[str, int]] = {}
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
@@ -509,6 +562,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         system_dp_rank = data["system_dp_rank"]
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
+        bootstrap_room = int(data["bootstrap_room"])
+
+        if bootstrap_room != -1:
+            async with self.lock:
+                self.prefill_dp_rank_table[bootstrap_room] = {
+                    "dp_rank": attn_dp_rank,
+                    "rank_port": rank_port,
+                    "rank_ip": rank_ip,
+                }
+            logger.debug(f"register bootstrap_room table {bootstrap_room=}")
+            return web.Response(text="OK", status=200)
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -543,11 +607,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.Response(text="OK", status=200)
 
     async def _handle_route_get(self, request: web.Request):
+        bootstrap_room = request.query.get("bootstrap_room")
         engine_rank = request.query.get("engine_rank")
         target_dp_group = request.query.get("target_dp_group")
         target_pp_rank = request.query.get("target_pp_rank")
         if not engine_rank or not target_dp_group or not target_pp_rank:
+            logger.debug(f"missing inputs")
             return web.Response(text="Missing inputs for bootstrap server.", status=400)
+
+        if int(bootstrap_room) != -1:
+            logger.debug(f"return prefill rank table")
+            return web.json_response(self.prefill_dp_rank_table, status=200)
 
         # Currently we use engine_rank == -1 and target_dp_group == -1 to sync dp size
         if (
@@ -560,6 +630,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "prefill_dp_size": self.dp_size,
                 "prefill_pp_size": self.pp_size,
             }
+            logger.debug(f"return prefill parallel info")
             return web.json_response(prefill_parallel_info, status=200)
 
         # Find corresponding prefill info
@@ -569,8 +640,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             ][int(target_pp_rank)]
 
         if bootstrap_info is not None:
+            logger.debug(f"return bootstrap info")
             return web.json_response(bootstrap_info, status=200)
         else:
+            logger.debug(f"bootstrap info not found")
             return web.Response(text="Bootstrap info not Found", status=404)
 
     def _run_server(self):

@@ -170,6 +170,7 @@ class DecodeRequest:
     kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    first_check: float = None
 
 
 class DecodePreallocQueue:
@@ -308,6 +309,7 @@ class DecodePreallocQueue:
                 kv_receiver_class = get_kv_class(
                     self.transfer_backend, KVClassType.RECEIVER
                 )
+            logger.debug(f"{req.bootstrap_host=} {self.transfer_backend=}")
 
             kv_receiver = kv_receiver_class(
                 mgr=self.kv_manager,
@@ -412,6 +414,7 @@ class DecodePreallocQueue:
 
         preallocated_reqs = []
         indices_to_remove = set()
+        bootstrap_table = None
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
@@ -432,6 +435,34 @@ class DecodePreallocQueue:
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
+            if hasattr(decode_req.kv_receiver, "_get_bootstrap_room_from_server"):
+                logger.debug(f"{bootstrap_table=}")
+                if bootstrap_table is None:
+                    start_time = time.perf_counter()
+                    bootstrap_table = (
+                        decode_req.kv_receiver._get_bootstrap_room_from_server(
+                            decode_req.req.bootstrap_room
+                        )
+                    )
+                    elapsed = time.perf_counter() - start_time
+                    logger.debug(f"{elapsed * 1e3=} {start_time=} {bootstrap_table=}")
+
+            if (
+                decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+                and str(decode_req.req.bootstrap_room) not in bootstrap_table
+            ):
+                logger.debug(f"{bootstrap_table=}")
+                logger.debug(
+                    f"bootstrap info for {decode_req.req.bootstrap_room} {decode_req.req.bootstrap_host} not found"
+                )
+                if decode_req.first_check is None:
+                    decode_req.first_check = time.perf_counter()
+                continue
+
+            if decode_req.first_check is not None:
+                elapsed = time.perf_counter() - decode_req.first_check
+                logger.error(f"request delayed for {elapsed * 1e3} ms")
+
             if i in indices_to_remove:
                 continue
 
