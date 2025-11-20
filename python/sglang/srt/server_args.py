@@ -259,6 +259,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    use_dynamic_chunked_prefill: bool = False
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
@@ -2086,6 +2087,12 @@ class ServerArgs:
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
             "This option is typically used for development and debugging purposes.",
+        )
+        parser.add_argument(
+            "--use-dynamic-chunked-prefill",
+            action="store_true",
+            default=ServerArgs.use_dynamic_chunked_prefill,
+            help="If set, the chunked prefill size is sized based on estimated attention cost",
         )
         parser.add_argument(
             "--chunked-prefill-size",

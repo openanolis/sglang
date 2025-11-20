@@ -1261,6 +1261,11 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
+                chunked_prefill_sizes=(
+                    [self.chunked_prefill_size, self.chunked_prefill_size // 2]
+                    if self.server_args.use_dynamic_chunked_prefill
+                    else None
+                ),  # TODO: fit quadratic
             )
             req.tokenizer = self.tokenizer
 
@@ -1752,6 +1757,15 @@ class Scheduler(
             # in the waiting queue.
             return None
 
+        chunked_prefill_size = self.chunked_prefill_size
+        if (
+            self.chunked_req is not None
+            and self.chunked_req.chunked_prefill_sizes is not None
+        ):
+            chunked_prefill_size = next(self.chunked_req.chunked_prefill_sizes)
+
+        print(f"chunked_prefill_size: {chunked_prefill_size}")
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -1760,7 +1774,7 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )

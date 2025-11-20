@@ -430,6 +430,16 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
+def dynamic_chunked_prefill_size(chunked_prefill_sizes: List[int]):
+    i = 0
+    while i <= len(chunked_prefill_sizes):
+        if i == len(chunked_prefill_sizes):
+            yield chunked_prefill_sizes[-1]
+        else:
+            yield chunked_prefill_sizes[i]
+            i += 1
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -462,6 +472,7 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        chunked_prefill_sizes: Optional[List[int]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -673,6 +684,13 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+
+        # For dynamic chunked prefill
+        self.chunked_prefill_sizes = None
+        if chunked_prefill_sizes is not None:
+            self.chunked_prefill_sizes = dynamic_chunked_prefill_size(
+                chunked_prefill_sizes
+            )
 
     @property
     def seqlen(self):
