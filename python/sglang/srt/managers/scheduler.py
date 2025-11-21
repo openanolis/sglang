@@ -459,6 +459,7 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
+        self.no_prev_chunked_req = True
 
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
@@ -1261,11 +1262,8 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
-                chunked_prefill_sizes=(
-                    [self.chunked_prefill_size, self.chunked_prefill_size // 2]
-                    if self.server_args.use_dynamic_chunked_prefill
-                    else None
-                ),  # TODO: fit quadratic
+                # chunked_prefill_sizes=[self.chunked_prefill_size, self.chunked_prefill_size // 2] if self.server_args.use_dynamic_chunked_prefill else None,
+                chunked_prefill_sizes=None,  # use to debug the warmup
             )
             req.tokenizer = self.tokenizer
 
@@ -1762,7 +1760,10 @@ class Scheduler(
             self.chunked_req is not None
             and self.chunked_req.chunked_prefill_sizes is not None
         ):
+            if self.no_prev_chunked_req:  # address off-by-one issue
+                _ = next(self.chunked_req.chunked_prefill_sizes)
             chunked_prefill_size = next(self.chunked_req.chunked_prefill_sizes)
+        self.no_prev_chunked_req = bool(self.chunked_req is None)
 
         print(f"chunked_prefill_size: {chunked_prefill_size}")
 

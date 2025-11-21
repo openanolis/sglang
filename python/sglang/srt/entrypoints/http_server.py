@@ -1534,7 +1534,54 @@ def _execute_server_warmup(
                     )
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
-
+        if (
+            server_args.use_dynamic_chunked_prefill
+            and server_args.chunked_prefill_size >= 1
+        ):
+            logger.info(f"Start of dynamic chunked prefill cost estimation ...")
+            num_run = 5
+            X = np.ones((8, 3))
+            estimates = np.zeros((8, num_run))
+            vocab_size = server_args.get_model_config().vocab_size
+            for k in range(8):
+                input_len = max(1, (server_args.chunked_prefill_size * (k + 1)) // 8)
+                X[k, 0] = input_len**2
+                X[k, 1] = input_len
+                for j in range(num_run):
+                    json_data = {
+                        "sampling_params": {
+                            "temperature": 0.0,
+                            "max_new_tokens": 1,
+                            "ignore_eos": True,
+                        },
+                        "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                        # This is a hack to ensure fake transfer is enabled during prefill warmup
+                        # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                        "bootstrap_room": [
+                            i * (2**63 // server_args.dp_size)
+                            + (i % server_args.tp_size)
+                            for i in range(server_args.dp_size)
+                        ],
+                        "input_ids": [
+                            np.random.randint(0, vocab_size, size=input_len).tolist()
+                        ]
+                        * server_args.dp_size,  # random sample token id because of radix cache
+                    }
+                    now = time.time()
+                    res = requests.post(
+                        url + request_name,
+                        json=json_data,
+                        headers=headers,
+                        timeout=600,
+                    )
+                    assert res.status_code == 200, f"{res.text}"
+                    estimates[k, j] = 1000 * (time.time() - now)  # milliseconds
+            estimates = np.mean(estimates, axis=1)
+            coef = np.linalg.lstsq(X, estimates, rcond=None)[0]
+            print(
+                f"dynamic_chunked_prefill estimates: {estimates}"
+            )  # TODO: remove debug print statement
+            print(f"estimated coef: {coef}")
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:

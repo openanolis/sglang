@@ -2092,7 +2092,7 @@ class ServerArgs:
             "--use-dynamic-chunked-prefill",
             action="store_true",
             default=ServerArgs.use_dynamic_chunked_prefill,
-            help="If set, the chunked prefill size is sized based on estimated attention cost",
+            help="If set, the chunked prefill size will be dynamically adjusted based on prefill cost.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
