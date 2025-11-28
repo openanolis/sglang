@@ -13,6 +13,7 @@ use std::{
 use crdts::{CvRDT, PNCounter};
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tracing::warn;
 
 /// State key for CRDT maps
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -225,7 +226,13 @@ impl CRDTPNCounter {
         // Convert BigInt to i64
         // Use try_into or manual conversion
         use num_traits::ToPrimitive;
-        big_val.to_i64().unwrap_or(0)
+        big_val.to_i64().unwrap_or_else(|| {
+            warn!(
+                "PNCounter value {} exceeds i64 range, truncating to 0. This may indicate rate limit counters growing too large.",
+                big_val
+            );
+            0
+        })
     }
 
     pub fn merge(&mut self, other: &Self) {
