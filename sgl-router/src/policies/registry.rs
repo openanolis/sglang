@@ -43,16 +43,17 @@ pub struct PolicyRegistry {
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy
     pub fn new(default_policy_config: PolicyConfig) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
-
-        Self {
+        let mut registry = Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
-            default_policy,
+            default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
             ha_sync: None,
-        }
+        };
+        let default_policy = registry.create_policy_from_config(&default_policy_config);
+        registry.default_policy = default_policy;
+        registry
     }
 
     /// Create a new PolicyRegistry with HA sync manager
@@ -60,16 +61,17 @@ impl PolicyRegistry {
         default_policy_config: PolicyConfig,
         ha_sync: OptionalHASyncManager,
     ) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
-
-        Self {
+        let mut registry = Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
-            default_policy,
+            default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
-            ha_sync,
-        }
+            ha_sync: ha_sync.clone(),
+        };
+        let default_policy = registry.create_policy_from_config(&default_policy_config);
+        registry.default_policy = default_policy;
+        registry
     }
 
     /// Set HA sync manager
@@ -213,7 +215,17 @@ impl PolicyRegistry {
         match policy_type {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
-            "cache_aware" => Arc::new(CacheAwarePolicy::new()),
+            "cache_aware" => {
+                // Create CacheAwarePolicy with HA sync if available
+                if let Some(ref ha_sync) = self.ha_sync {
+                    Arc::new(CacheAwarePolicy::with_config_and_ha_sync(
+                        CacheAwareConfig::default(),
+                        Some(ha_sync.clone()),
+                    ))
+                } else {
+                    Arc::new(CacheAwarePolicy::new())
+                }
+            }
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "bucket" => Arc::new(BucketPolicy::new()),
             _ => {
@@ -224,7 +236,7 @@ impl PolicyRegistry {
     }
 
     /// Create a policy from a PolicyConfig
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+    fn create_policy_from_config(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
@@ -242,7 +254,15 @@ impl PolicyRegistry {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
                 };
-                Arc::new(CacheAwarePolicy::with_config(cache_config))
+                // Create CacheAwarePolicy with HA sync if available
+                if let Some(ref ha_sync) = self.ha_sync {
+                    Arc::new(CacheAwarePolicy::with_config_and_ha_sync(
+                        cache_config,
+                        Some(ha_sync.clone()),
+                    ))
+                } else {
+                    Arc::new(CacheAwarePolicy::with_config(cache_config))
+                }
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::Bucket {
@@ -440,6 +460,47 @@ impl PolicyRegistry {
                         );
                         bucket.init_prefill_worker_urls(prefill_workers);
                     }
+                }
+            }
+        }
+    }
+
+    /// Apply remote tree operation to cache-aware policy for a model
+    /// This is called when receiving tree state updates from HA
+    pub fn apply_remote_tree_operation(
+        &self,
+        model_id: &str,
+        operation: &crate::ha::tree_ops::TreeOperation,
+    ) {
+        // Try to find the policy for this model
+        if let Some(policy) = self.get_policy(model_id) {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        // Also check default policy if it's cache-aware
+        if self.default_policy.name() == "cache_aware" {
+            if let Some(cache_aware) = self.default_policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                cache_aware.apply_remote_tree_operation(model_id, operation);
+            }
+        }
+
+        // Check prefill and decode policies for PD mode
+        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
+            if prefill_policy.name() == "cache_aware" {
+                if let Some(cache_aware) = prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        if let Some(decode_policy) = self.decode_policy.read().unwrap().as_ref() {
+            if decode_policy.name() == "cache_aware" {
+                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
                 }
             }
         }

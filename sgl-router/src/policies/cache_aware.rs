@@ -63,21 +63,27 @@ use std::{sync::Arc, thread, time::Duration};
 
 use dashmap::DashMap;
 use rand::Rng;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{
+    core::Worker,
+    ha::{tree_ops::TreeOperation, OptionalHASyncManager},
+    metrics::RouterMetrics,
+};
 
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
 /// switches to shortest-queue routing when load is imbalanced.
 /// Maintains separate trees per model for multi-model support.
+/// Supports HA synchronization of tree operations across cluster nodes.
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
     eviction_handle: Option<thread::JoinHandle<()>>,
+    ha_sync: OptionalHASyncManager,
 }
 
 impl CacheAwarePolicy {
@@ -86,6 +92,13 @@ impl CacheAwarePolicy {
     }
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
+        Self::with_config_and_ha_sync(config, None)
+    }
+
+    pub fn with_config_and_ha_sync(
+        config: CacheAwareConfig,
+        ha_sync: OptionalHASyncManager,
+    ) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
 
         // Start background eviction thread if configured
@@ -112,10 +125,26 @@ impl CacheAwarePolicy {
             None
         };
 
-        Self {
+        let policy = Self {
             config,
             trees,
             eviction_handle,
+            ha_sync: ha_sync.clone(),
+        };
+
+        // Restore tree state from HA if available
+        if ha_sync.is_some() {
+            policy.restore_tree_state_from_ha();
+        }
+
+        policy
+    }
+
+    /// Set HA sync manager (can be called after construction)
+    pub fn set_ha_sync(&mut self, ha_sync: OptionalHASyncManager) {
+        self.ha_sync = ha_sync.clone();
+        if ha_sync.is_some() {
+            self.restore_tree_state_from_ha();
         }
     }
 
@@ -194,9 +223,89 @@ impl CacheAwarePolicy {
     pub fn remove_worker_by_url(&self, url: &str) {
         // Remove from all trees since we don't know which model it belongs to
         for tree_ref in self.trees.iter() {
+            let model_id = tree_ref.key().clone();
             tree_ref.value().remove_tenant(url);
+            
+            // Sync removal to HA
+            if let Some(ref ha_sync) = self.ha_sync {
+                use crate::ha::tree_ops::TreeRemoveOp;
+                let op = TreeOperation::Remove(TreeRemoveOp {
+                    tenant: url.to_string(),
+                });
+                if let Err(e) = ha_sync.sync_tree_operation(model_id, op) {
+                    warn!("Failed to sync tree remove operation to HA: {}", e);
+                }
+            }
         }
     }
+
+    /// Restore tree state from HA store
+    /// This is called during initialization to rebuild trees from synchronized state
+    fn restore_tree_state_from_ha(&self) {
+        if let Some(ref ha_sync) = self.ha_sync {
+            // Get all tree states from HA
+            // We need to iterate through all models that have tree states
+            // For now, we'll restore trees for models that are already in our trees map
+            // In a full implementation, we might want to query HA for all tree states
+            
+            for tree_ref in self.trees.iter() {
+                let model_id = tree_ref.key();
+                if let Some(tree_state) = ha_sync.get_tree_state(model_id) {
+                    debug!(
+                        "Restoring tree state for model {} with {} operations",
+                        model_id,
+                        tree_state.operations.len()
+                    );
+                    
+                    let tree = tree_ref.value();
+                    // Apply all operations to rebuild the tree
+                    for operation in &tree_state.operations {
+                        match operation {
+                            TreeOperation::Insert(insert_op) => {
+                                tree.insert(&insert_op.text, &insert_op.tenant);
+                            }
+                            TreeOperation::Remove(remove_op) => {
+                                tree.remove_tenant(&remove_op.tenant);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply remote tree operation from HA
+    /// This is called when receiving tree state updates from other nodes
+    pub fn apply_remote_tree_operation(&self, model_id: &str, operation: &TreeOperation) {
+        let tree_key = if model_id.is_empty() || model_id == "unknown" {
+            "default"
+        } else {
+            model_id
+        };
+
+        let tree = self
+            .trees
+            .entry(tree_key.to_string())
+            .or_insert_with(|| Arc::new(Tree::new()));
+
+        match operation {
+            TreeOperation::Insert(insert_op) => {
+                tree.insert(&insert_op.text, &insert_op.tenant);
+                debug!(
+                    "Applied remote tree insert: model={}, text={}, tenant={}",
+                    model_id, insert_op.text, insert_op.tenant
+                );
+            }
+            TreeOperation::Remove(remove_op) => {
+                tree.remove_tenant(&remove_op.tenant);
+                debug!(
+                    "Applied remote tree remove: model={}, tenant={}",
+                    model_id, remove_op.tenant
+                );
+            }
+        }
+    }
+
 
     /// Run cache eviction to prevent unbounded growth
     pub fn evict_cache(&self, max_size: usize) {
@@ -270,8 +379,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
                 if let Some(tree) = tree {
+                    let worker_url = workers[min_load_idx].url();
                     // Now we can work with the tree without holding the HashMap lock
-                    tree.insert(text, workers[min_load_idx].url());
+                    tree.insert(text, worker_url);
+                    
+                    // Sync insert operation to HA
+                    if let Some(ref ha_sync) = self.ha_sync {
+                        use crate::ha::tree_ops::TreeInsertOp;
+                        let op = TreeOperation::Insert(TreeInsertOp {
+                            text: text.to_string(),
+                            tenant: worker_url.to_string(),
+                        });
+                        if let Err(e) = ha_sync.sync_tree_operation(model_id.to_string(), op) {
+                            warn!("Failed to sync tree insert operation to HA: {}", e);
+                        }
+                    }
                 } else {
                     debug!(
                         "Warning: No tree found for model '{}', skipping cache update",
@@ -318,6 +440,18 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 if workers[selected_idx].is_healthy() {
                     // Update the tree with this request
                     tree.insert(text, &selected_url);
+                    
+                    // Sync insert operation to HA
+                    if let Some(ref ha_sync) = self.ha_sync {
+                        use crate::ha::tree_ops::TreeInsertOp;
+                        let op = TreeOperation::Insert(TreeInsertOp {
+                            text: text.to_string(),
+                            tenant: selected_url.clone(),
+                        });
+                        if let Err(e) = ha_sync.sync_tree_operation(model_id.to_string(), op) {
+                            warn!("Failed to sync tree insert operation to HA: {}", e);
+                        }
+                    }
 
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
@@ -329,6 +463,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Selected worker no longer exists, remove it from tree
                 tree.remove_tenant(&selected_url);
                 debug!("Removed stale worker {} from cache tree", selected_url);
+                
+                // Sync removal to HA
+                if let Some(ref ha_sync) = self.ha_sync {
+                    use crate::ha::tree_ops::TreeRemoveOp;
+                    let op = TreeOperation::Remove(TreeRemoveOp {
+                        tenant: selected_url.clone(),
+                    });
+                    if let Err(e) = ha_sync.sync_tree_operation(model_id.to_string(), op) {
+                        warn!("Failed to sync tree remove operation to HA: {}", e);
+                    }
+                }
             }
 
             // Fallback to first healthy worker
