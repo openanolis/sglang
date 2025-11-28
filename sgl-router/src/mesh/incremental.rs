@@ -130,6 +130,22 @@ impl IncrementalUpdateCollector {
         updates
     }
 
+    /// Generic helper to collect versions for a store
+    fn collect_versions<T>(
+        items: &std::collections::BTreeMap<SKey, T>,
+        get_version: impl Fn(&SKey) -> Option<u64>,
+        default_version: u64,
+    ) -> HashMap<String, u64> {
+        items
+            .keys()
+            .map(|key| {
+                let key_str = key.as_str().to_string();
+                let version = get_version(key).unwrap_or(default_version);
+                (key_str, version)
+            })
+            .collect()
+    }
+
     /// Collect incremental updates for a specific store type
     pub fn collect_updates_for_store(&self, store_type: StoreType) -> Vec<StateUpdate> {
         let mut updates = Vec::new();
@@ -139,20 +155,11 @@ impl IncrementalUpdateCollector {
             StoreType::Worker => {
                 use super::stores::WorkerState;
                 let all_workers = self.stores.worker.all();
-                // Collect versions first to avoid borrowing issues
-                let versions: HashMap<String, u64> = all_workers
-                    .keys()
-                    .map(|key| {
-                        let key_str = key.as_str().to_string();
-                        let version = self
-                            .stores
-                            .worker
-                            .get_metadata(key)
-                            .map(|(v, _)| v)
-                            .unwrap_or_default();
-                        (key_str, version)
-                    })
-                    .collect();
+                let versions = Self::collect_versions(
+                    &all_workers,
+                    |key| self.stores.worker.get_metadata(key).map(|(v, _)| v),
+                    0,
+                );
                 updates.extend(Self::collect_serialized_updates(
                     all_workers,
                     versions,
@@ -165,20 +172,11 @@ impl IncrementalUpdateCollector {
             StoreType::Policy => {
                 use super::stores::PolicyState;
                 let all_policies = self.stores.policy.all();
-                // Collect versions first to avoid borrowing issues
-                let versions: HashMap<String, u64> = all_policies
-                    .keys()
-                    .map(|key| {
-                        let key_str = key.as_str().to_string();
-                        let version = self
-                            .stores
-                            .policy
-                            .get_metadata(key)
-                            .map(|(v, _)| v)
-                            .unwrap_or(0);
-                        (key_str, version)
-                    })
-                    .collect();
+                let versions = Self::collect_versions(
+                    &all_policies,
+                    |key| self.stores.policy.get_metadata(key).map(|(v, _)| v),
+                    0,
+                );
                 updates.extend(Self::collect_serialized_updates(
                     all_policies,
                     versions,
@@ -191,20 +189,11 @@ impl IncrementalUpdateCollector {
             StoreType::App => {
                 use super::stores::AppState;
                 let all_apps = self.stores.app.all();
-                // Collect versions first to avoid borrowing issues
-                let versions: HashMap<String, u64> = all_apps
-                    .keys()
-                    .map(|key| {
-                        let key_str = key.as_str().to_string();
-                        let version = self
-                            .stores
-                            .app
-                            .get_metadata(key)
-                            .map(|(v, _)| v)
-                            .unwrap_or(0);
-                        (key_str, version)
-                    })
-                    .collect();
+                let versions = Self::collect_versions(
+                    &all_apps,
+                    |key| self.stores.app.get_metadata(key).map(|(v, _)| v),
+                    0,
+                );
                 updates.extend(Self::collect_direct_updates(
                     all_apps,
                     versions,
@@ -218,20 +207,11 @@ impl IncrementalUpdateCollector {
             StoreType::Membership => {
                 use super::stores::MembershipState;
                 let all_members = self.stores.membership.all();
-                // Collect versions first to avoid borrowing issues
-                let versions: HashMap<String, u64> = all_members
-                    .keys()
-                    .map(|key| {
-                        let key_str = key.as_str().to_string();
-                        let version = self
-                            .stores
-                            .membership
-                            .get_metadata(key)
-                            .map(|(v, _)| v)
-                            .unwrap_or(0);
-                        (key_str, version)
-                    })
-                    .collect();
+                let versions = Self::collect_versions(
+                    &all_members,
+                    |key| self.stores.membership.get_metadata(key).map(|(v, _)| v),
+                    0,
+                );
                 updates.extend(Self::collect_serialized_updates(
                     all_members,
                     versions,

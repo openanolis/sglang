@@ -45,7 +45,6 @@ impl MeshController {
         let mut cnt: u64 = 0;
 
         // Track retry managers for each peer
-        use std::collections::HashMap;
         let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
 
         loop {
