@@ -104,7 +104,7 @@ deadpool-postgres = "0.14.1"
 # CRDT for HA state synchronization
 crdts = "7.3"
 # mTLS support
-rustls-pemfile = "2.1"
+rustls-pemfile = "2.2"
 
 
 [build-dependencies]
