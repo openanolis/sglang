@@ -87,6 +87,7 @@ use crate::{
 /// switches to shortest-queue routing when load is imbalanced.
 /// Maintains separate trees per model for multi-model support.
 /// Supports mesh synchronization of tree operations across cluster nodes.
+/// When mesh is not enabled, the policy works independently without synchronization.
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
@@ -377,7 +378,7 @@ impl CacheAwarePolicy {
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
-                // Sync insert operation to mesh
+                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
                     use crate::mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
@@ -470,7 +471,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     // Update the tree with this request
                     tree.insert(text, &selected_url);
 
-                    // Sync insert operation to mesh
+                    // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                     if let Some(ref mesh_sync) = self.mesh_sync {
                         use crate::mesh::tree_ops::TreeInsertOp;
                         let op = TreeOperation::Insert(TreeInsertOp {
@@ -492,7 +493,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 tree.remove_tenant(&selected_url);
                 debug!("Removed stale worker {} from cache tree", selected_url);
 
-                // Sync removal to mesh
+                // Sync removal to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
                     use crate::mesh::tree_ops::TreeRemoveOp;
                     let op = TreeOperation::Remove(TreeRemoveOp {

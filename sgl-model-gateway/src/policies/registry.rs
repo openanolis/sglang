@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
 use serde_json;
@@ -35,7 +35,9 @@ pub struct PolicyRegistry {
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
     /// Optional mesh sync manager for state synchronization
-    mesh_sync: OptionalMeshSyncManager,
+    /// When None, the registry works independently without mesh synchronization
+    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
+    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl PolicyRegistry {
@@ -47,7 +49,7 @@ impl PolicyRegistry {
             default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
-            mesh_sync: None,
+            mesh_sync: Arc::new(RwLock::new(None)),
         };
         let default_policy = registry.create_policy_from_config(&default_policy_config);
         registry.default_policy = default_policy;
@@ -65,16 +67,16 @@ impl PolicyRegistry {
             default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
-            mesh_sync: mesh_sync.clone(),
+            mesh_sync: Arc::new(RwLock::new(mesh_sync.clone())),
         };
         let default_policy = registry.create_policy_from_config(&default_policy_config);
         registry.default_policy = default_policy;
         registry
     }
 
-    /// Set mesh sync manager
-    pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
-        self.mesh_sync = mesh_sync;
+    /// Set mesh sync manager (thread-safe, can be called after initialization)
+    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
+        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Called when a worker is added
@@ -116,8 +118,8 @@ impl PolicyRegistry {
         self.model_policies
             .insert(model_id.to_string(), Arc::clone(&policy));
 
-        // Sync to mesh if enabled
-        if let Some(ref mesh_sync) = self.mesh_sync {
+        // Sync to mesh if enabled (no-op if mesh is not enabled)
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
             // Serialize policy config (simplified - just store policy name for now)
             let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
             mesh_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
@@ -161,8 +163,8 @@ impl PolicyRegistry {
                 );
             }
 
-            // Sync removal to mesh if enabled
-            if let Some(ref mesh_sync) = self.mesh_sync {
+            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
                 mesh_sync.remove_policy_state(model_id);
             }
         }
@@ -208,7 +210,7 @@ impl PolicyRegistry {
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => {
                 // Create CacheAwarePolicy with mesh sync if available
-                if let Some(ref mesh_sync) = self.mesh_sync {
+                if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
                     Arc::new(CacheAwarePolicy::with_config_and_mesh_sync(
                         CacheAwareConfig::default(),
                         Some(mesh_sync.clone()),
@@ -246,7 +248,7 @@ impl PolicyRegistry {
                     max_tree_size: *max_tree_size,
                 };
                 // Create CacheAwarePolicy with mesh sync if available
-                if let Some(ref mesh_sync) = self.mesh_sync {
+                if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
                     Arc::new(CacheAwarePolicy::with_config_and_mesh_sync(
                         cache_config,
                         Some(mesh_sync.clone()),
