@@ -61,7 +61,9 @@ pub struct WorkerRegistry {
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
     /// Optional mesh sync manager for state synchronization
-    mesh_sync: OptionalMeshSyncManager,
+    /// When None, the registry works independently without mesh synchronization
+    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
+    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl WorkerRegistry {
@@ -74,7 +76,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
-            mesh_sync: None,
+            mesh_sync: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -87,13 +89,13 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
-            mesh_sync,
+            mesh_sync: Arc::new(RwLock::new(mesh_sync)),
         }
     }
 
-    /// Set mesh sync manager
-    pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
-        self.mesh_sync = mesh_sync;
+    /// Set mesh sync manager (thread-safe, can be called after initialization)
+    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
+        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Register a new worker
@@ -139,8 +141,8 @@ impl WorkerRegistry {
             .or_default()
             .push(worker_id.clone());
 
-        // Sync to mesh if enabled
-        if let Some(ref mesh_sync) = self.mesh_sync {
+        // Sync to mesh if enabled (no-op if mesh is not enabled)
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
             mesh_sync.sync_worker_state(
                 worker_id.as_str().to_string(),
                 worker.model_id().to_string(),
@@ -185,8 +187,8 @@ impl WorkerRegistry {
                 conn_workers.retain(|id| id != worker_id);
             }
 
-            // Sync removal to mesh if enabled
-            if let Some(ref mesh_sync) = self.mesh_sync {
+            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
                 mesh_sync.remove_worker_state(worker_id.as_str());
             }
 
@@ -251,8 +253,8 @@ impl WorkerRegistry {
             // Update worker health (if Worker trait has a method for this)
             // For now, we'll just sync to mesh
 
-            // Sync to mesh if enabled
-            if let Some(ref mesh_sync) = self.mesh_sync {
+            // Sync to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
                 mesh_sync.sync_worker_state(
                     worker_id.as_str().to_string(),
                     worker.model_id().to_string(),
