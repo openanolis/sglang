@@ -29,17 +29,17 @@ use crate::{
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
-    ha::{
+    logging::{self, LoggingConfig},
+    mesh::{
         endpoints::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
-            get_ha_health, get_policy_state, get_policy_states, get_worker_state,
+            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
             get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
         },
         rate_limit_window::RateLimitWindow,
-        service::{HAServerConfig, HAServerHandler},
-        sync::HASyncManager,
+        service::{MeshServerConfig, MeshServerHandler},
+        sync::MeshSyncManager,
     },
-    logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
     middleware::{self, AuthConfig, QueuedRequest},
     protocols::{
@@ -63,8 +63,8 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
-    pub ha_handler: Option<Arc<HAServerHandler>>,
-    pub ha_sync_manager: Option<Arc<HASyncManager>>,
+    pub mesh_handler: Option<Arc<MeshServerHandler>>,
+    pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
 }
 
 async fn sink_handler() -> Response {
@@ -609,7 +609,7 @@ pub struct ServerConfig {
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
-    pub ha_server_config: Option<HAServerConfig>,
+    pub mesh_server_config: Option<MeshServerConfig>,
 }
 
 pub fn build_app(
@@ -690,20 +690,20 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
-    // HA management routes
-    let ha_routes = Router::new()
-        .route("/ha/status", get(get_cluster_status))
-        .route("/ha/health", get(get_ha_health))
-        .route("/ha/workers", get(get_worker_states))
-        .route("/ha/workers/{worker_id}", get(get_worker_state))
-        .route("/ha/policies", get(get_policy_states))
-        .route("/ha/policies/{model_id}", get(get_policy_state))
-        .route("/ha/config/{key}", get(get_app_config))
-        .route("/ha/config", post(update_app_config))
-        .route("/ha/rate-limit", post(set_global_rate_limit))
-        .route("/ha/rate-limit", get(get_global_rate_limit))
-        .route("/ha/rate-limit/stats", get(get_global_rate_limit_stats))
-        .route("/ha/shutdown", post(trigger_graceful_shutdown))
+    // Mesh management routes
+    let mesh_routes = Router::new()
+        .route("/mesh/status", get(get_cluster_status))
+        .route("/mesh/health", get(get_mesh_health))
+        .route("/mesh/workers", get(get_worker_states))
+        .route("/mesh/workers/{worker_id}", get(get_worker_state))
+        .route("/mesh/policies", get(get_policy_states))
+        .route("/mesh/policies/{model_id}", get(get_policy_state))
+        .route("/mesh/config/{key}", get(get_app_config))
+        .route("/mesh/config", post(update_app_config))
+        .route("/mesh/rate-limit", post(set_global_rate_limit))
+        .route("/mesh/rate-limit", get(get_global_rate_limit))
+        .route("/mesh/rate-limit/stats", get(get_global_rate_limit_stats))
+        .route("/mesh/shutdown", post(trigger_graceful_shutdown))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -714,7 +714,7 @@ pub fn build_app(
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
-        .merge(ha_routes)
+        .merge(mesh_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -756,48 +756,49 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         metrics::start_prometheus(prometheus_config.clone());
     }
 
-    let (ha_handler, ha_sync_manager) = if let Some(ha_server_config) = &config.ha_server_config {
-        // Create HA sync manager with stores first
-        use crate::ha::{stores::StateStores, sync::HASyncManager};
-        let stores = Arc::new(StateStores::with_self_name(
-            ha_server_config.self_name.clone(),
-        ));
-        let sync_manager = Arc::new(HASyncManager::new(
-            stores.clone(),
-            ha_server_config.self_name.clone(),
-        ));
+    let (mesh_handler, mesh_sync_manager) =
+        if let Some(mesh_server_config) = &config.mesh_server_config {
+            // Create mesh sync manager with stores first
+            use crate::mesh::{stores::StateStores, sync::MeshSyncManager};
+            let stores = Arc::new(StateStores::with_self_name(
+                mesh_server_config.self_name.clone(),
+            ));
+            let sync_manager = Arc::new(MeshSyncManager::new(
+                stores.clone(),
+                mesh_server_config.self_name.clone(),
+            ));
 
-        // Partition detector is created in HAServerHandler::with_partition_and_state_machine
+            // Partition detector is created in MeshServerHandler::with_partition_and_state_machine
 
-        // Initialize rate-limit hash ring with current membership
-        sync_manager.update_rate_limit_membership();
+            // Initialize rate-limit hash ring with current membership
+            sync_manager.update_rate_limit_membership();
 
-        // Start rate limit window reset task
-        let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
-        spawn(async move {
-            window_manager.start_reset_task().await;
-        });
+            // Start rate limit window reset task
+            let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
+            spawn(async move {
+                window_manager.start_reset_task().await;
+            });
 
-        // Create HA server builder and build with stores
-        use crate::ha::service::HAServerBuilder;
-        let builder = HAServerBuilder::new(
-            ha_server_config.self_name.clone(),
-            ha_server_config.self_addr,
-            ha_server_config.init_peer,
-        );
-        let (ha_server, handler) = builder.build_with_stores(Some(stores.clone()));
+            // Create mesh server builder and build with stores
+            use crate::mesh::service::MeshServerBuilder;
+            let builder = MeshServerBuilder::new(
+                mesh_server_config.self_name.clone(),
+                mesh_server_config.self_addr,
+                mesh_server_config.init_peer,
+            );
+            let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
 
-        // Spawn the HA server
-        spawn(async move {
-            if let Err(e) = ha_server.start_serve().await {
-                tracing::error!("HA server failed: {}", e);
-            }
-        });
+            // Spawn the mesh server
+            spawn(async move {
+                if let Err(e) = mesh_server.start_serve().await {
+                    tracing::error!("Mesh server failed: {}", e);
+                }
+            });
 
-        (Some(Arc::new(handler)), Some(sync_manager))
-    } else {
-        (None, None)
-    };
+            (Some(Arc::new(handler)), Some(sync_manager))
+        } else {
+            (None, None)
+        };
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
@@ -928,17 +929,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Get HA cluster state and port before moving ha_handler into app_state
-    let ha_cluster_state = ha_handler.as_ref().map(|h| h.state.clone());
-    let ha_port = config.ha_server_config.as_ref().map(|c| c.self_addr.port());
+    // Get mesh cluster state and port before moving mesh_handler into app_state
+    let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
+    let mesh_port = config
+        .mesh_server_config
+        .as_ref()
+        .map(|c| c.self_addr.port());
 
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
-        ha_handler,
-        ha_sync_manager,
+        mesh_handler,
+        mesh_sync_manager,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
@@ -947,8 +951,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             match start_service_discovery(
                 service_discovery_config,
                 app_context_arc,
-                ha_cluster_state,
-                ha_port,
+                mesh_cluster_state,
+                mesh_port,
             )
             .await
             {

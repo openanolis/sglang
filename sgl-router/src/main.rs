@@ -9,7 +9,7 @@ use sglang_router_rs::{
         RouterConfig, RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
-    ha::service::HAServerConfig,
+    mesh::service::MeshServerConfig,
     metrics::PrometheusConfig,
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
@@ -348,16 +348,16 @@ struct CliArgs {
     mcp_config_path: Option<String>,
 
     #[arg(long, default_value_t = false)]
-    enable_ha: bool,
+    enable_mesh: bool,
 
     #[arg(long)]
-    ha_server_name: Option<String>,
+    mesh_server_name: Option<String>,
 
     #[arg(long, default_value = "0.0.0.0")]
-    ha_host: String,
+    mesh_host: String,
 
     #[arg(long, default_value_t = 39527)]
-    ha_port: u16,
+    mesh_port: u16,
 
     #[arg(long, num_args = 0..)]
     peer_urls: Vec<String>,
@@ -543,7 +543,7 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 router_selector: HashMap::new(), // Can be set via config file
-                router_ha_port_annotation: "sglang.ai/ha-port".to_string(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -663,16 +663,16 @@ impl CliArgs {
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
         let service_discovery_config = if self.service_discovery {
             // Get router discovery config from router_config.discovery if available
-            let (router_selector, router_ha_port_annotation) = router_config
+            let (router_selector, router_mesh_port_annotation) = router_config
                 .discovery
                 .as_ref()
                 .map(|d| {
                     (
                         d.router_selector.clone(),
-                        d.router_ha_port_annotation.clone(),
+                        d.router_mesh_port_annotation.clone(),
                     )
                 })
-                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/ha-port".to_string()));
+                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
 
             Some(ServiceDiscoveryConfig {
                 enabled: true,
@@ -685,7 +685,7 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 router_selector,
-                router_ha_port_annotation,
+                router_mesh_port_annotation,
             })
         } else {
             None
@@ -696,15 +696,15 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        let ha_server_config = if self.enable_ha {
-            let self_name = if let Some(name) = &self.ha_server_name {
+        let mesh_server_config = if self.enable_mesh {
+            let self_name = if let Some(name) = &self.mesh_server_name {
                 name.to_string()
             } else {
                 // If name is not set, use a random name
                 let mut rng = rand::rng();
                 let random_string: String =
                     (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
-                format!("HA_{}", random_string)
+                format!("Mesh_{}", random_string)
             };
 
             let peer = self
@@ -712,15 +712,15 @@ impl CliArgs {
                 .first()
                 .and_then(|url| url.parse::<std::net::SocketAddr>().ok());
             if let Ok(addr) =
-                format!("{}:{}", self.ha_host, self.ha_port).parse::<std::net::SocketAddr>()
+                format!("{}:{}", self.mesh_host, self.mesh_port).parse::<std::net::SocketAddr>()
             {
-                Some(HAServerConfig {
+                Some(MeshServerConfig {
                     self_name,
                     self_addr: addr,
                     init_peer: peer,
                 })
             } else {
-                tracing::warn!("Invalid HA server address, so HA server will not be started");
+                tracing::warn!("Invalid mesh server address, so mesh server will not be started");
                 None
             }
         } else {
@@ -742,7 +742,7 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
-            ha_server_config,
+            mesh_server_config,
         }
     }
 }

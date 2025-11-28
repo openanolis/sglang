@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     core::{ConnectionMode, Worker, WorkerType},
-    ha::OptionalHASyncManager,
+    mesh::OptionalMeshSyncManager,
 };
 
 /// Unique identifier for a worker
@@ -60,8 +60,8 @@ pub struct WorkerRegistry {
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
-    /// Optional HA sync manager for state synchronization
-    ha_sync: OptionalHASyncManager,
+    /// Optional mesh sync manager for state synchronization
+    mesh_sync: OptionalMeshSyncManager,
 }
 
 impl WorkerRegistry {
@@ -74,12 +74,12 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
-            ha_sync: None,
+            mesh_sync: None,
         }
     }
 
-    /// Create a new worker registry with HA sync manager
-    pub fn with_ha_sync(ha_sync: OptionalHASyncManager) -> Self {
+    /// Create a new worker registry with mesh sync manager
+    pub fn with_mesh_sync(mesh_sync: OptionalMeshSyncManager) -> Self {
         Self {
             workers: Arc::new(DashMap::new()),
             model_workers: Arc::new(DashMap::new()),
@@ -87,13 +87,13 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
-            ha_sync,
+            mesh_sync,
         }
     }
 
-    /// Set HA sync manager
-    pub fn set_ha_sync(&mut self, ha_sync: OptionalHASyncManager) {
-        self.ha_sync = ha_sync;
+    /// Set mesh sync manager
+    pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
+        self.mesh_sync = mesh_sync;
     }
 
     /// Register a new worker
@@ -139,9 +139,9 @@ impl WorkerRegistry {
             .or_default()
             .push(worker_id.clone());
 
-        // Sync to HA if enabled
-        if let Some(ref ha_sync) = self.ha_sync {
-            ha_sync.sync_worker_state(
+        // Sync to mesh if enabled
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            mesh_sync.sync_worker_state(
                 worker_id.as_str().to_string(),
                 worker.model_id().to_string(),
                 worker.url().to_string(),
@@ -185,9 +185,9 @@ impl WorkerRegistry {
                 conn_workers.retain(|id| id != worker_id);
             }
 
-            // Sync removal to HA if enabled
-            if let Some(ref ha_sync) = self.ha_sync {
-                ha_sync.remove_worker_state(worker_id.as_str());
+            // Sync removal to mesh if enabled
+            if let Some(ref mesh_sync) = self.mesh_sync {
+                mesh_sync.remove_worker_state(worker_id.as_str());
             }
 
             Some(worker)
@@ -245,15 +245,15 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
-    /// Update worker health status and sync to HA
+    /// Update worker health status and sync to mesh
     pub fn update_worker_health(&self, worker_id: &WorkerId, is_healthy: bool) {
         if let Some(worker) = self.workers.get(worker_id) {
             // Update worker health (if Worker trait has a method for this)
-            // For now, we'll just sync to HA
+            // For now, we'll just sync to mesh
 
-            // Sync to HA if enabled
-            if let Some(ref ha_sync) = self.ha_sync {
-                ha_sync.sync_worker_state(
+            // Sync to mesh if enabled
+            if let Some(ref mesh_sync) = self.mesh_sync {
+                mesh_sync.sync_worker_state(
                     worker_id.as_str().to_string(),
                     worker.model_id().to_string(),
                     worker.url().to_string(),
