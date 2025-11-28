@@ -355,7 +355,7 @@ pub struct DiscoveryConfig {
     /// PD mode decode
     pub decode_selector: HashMap<String, String>,
     pub bootstrap_port_annotation: String,
-    /// Router node discovery for HA (Kubernetes label selector)
+    /// Router node discovery for mesh (Kubernetes label selector)
     #[serde(default)]
     pub router_selector: HashMap<String, String>,
     /// Annotation key to read mesh port from Router Pods
