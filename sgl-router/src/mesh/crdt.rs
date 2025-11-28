@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crdts::{CvRDT, PNCounter};
+use crdts::{CmRDT, CvRDT, PNCounter};
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::warn;
@@ -208,14 +208,16 @@ impl CRDTPNCounter {
     }
 
     pub fn inc(&mut self, actor: String, delta: i64) {
-        // PNCounter API: inc(actor) increments by 1, dec(actor) decrements by 1
+        // PNCounter API: inc(actor) and dec(actor) return operations that need to be applied
         if delta > 0 {
             for _ in 0..delta as u64 {
-                self.inner.inc(actor.clone());
+                let op = self.inner.inc(actor.clone());
+                <PNCounter<String> as CmRDT>::apply(&mut self.inner, op);
             }
         } else if delta < 0 {
             for _ in 0..(-delta) as u64 {
-                self.inner.dec(actor.clone());
+                let op = self.inner.dec(actor.clone());
+                <PNCounter<String> as CmRDT>::apply(&mut self.inner, op);
             }
         }
     }
@@ -224,15 +226,25 @@ impl CRDTPNCounter {
         // PNCounter returns BigInt, convert to i64
         let big_val = self.inner.read();
         // Convert BigInt to i64
-        // Use try_into or manual conversion
         use num_traits::ToPrimitive;
-        big_val.to_i64().unwrap_or_else(|| {
-            warn!(
-                "PNCounter value {} exceeds i64 range, truncating to 0. This may indicate rate limit counters growing too large.",
-                big_val
-            );
-            0
-        })
+        // Try direct conversion first
+        match big_val.to_i64() {
+            Some(val) => val,
+            None => {
+                // If direct conversion fails, try via string
+                let val_str = big_val.to_string();
+                match val_str.parse::<i64>() {
+                    Ok(val) => val,
+                    Err(_) => {
+                        warn!(
+                            "PNCounter value {} exceeds i64 range, truncating to 0. This may indicate rate limit counters growing too large.",
+                            big_val
+                        );
+                        0
+                    }
+                }
+            }
+        }
     }
 
     pub fn merge(&mut self, other: &Self) {

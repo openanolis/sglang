@@ -849,11 +849,12 @@ mod tests {
         use crate::mesh::tree_ops::{TreeInsertOp, TreeOperation, TreeState};
 
         let mut tree_state = TreeState::new("model1".to_string());
-        tree_state.version = 5;
         tree_state.add_operation(TreeOperation::Insert(TreeInsertOp {
             text: "remote_text".to_string(),
             tenant: "http://localhost:8001".to_string(),
         }));
+        // Set version after add_operation (which increments version)
+        tree_state.version = 5;
 
         manager.apply_remote_tree_operation(
             "model1".to_string(),
