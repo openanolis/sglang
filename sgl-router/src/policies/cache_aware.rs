@@ -225,7 +225,7 @@ impl CacheAwarePolicy {
         for tree_ref in self.trees.iter() {
             let model_id = tree_ref.key().clone();
             tree_ref.value().remove_tenant(url);
-            
+
             // Sync removal to HA
             if let Some(ref ha_sync) = self.ha_sync {
                 use crate::ha::tree_ops::TreeRemoveOp;
@@ -247,7 +247,7 @@ impl CacheAwarePolicy {
             // We need to iterate through all models that have tree states
             // For now, we'll restore trees for models that are already in our trees map
             // In a full implementation, we might want to query HA for all tree states
-            
+
             for tree_ref in self.trees.iter() {
                 let model_id = tree_ref.key();
                 if let Some(tree_state) = ha_sync.get_tree_state(model_id) {
@@ -256,7 +256,7 @@ impl CacheAwarePolicy {
                         model_id,
                         tree_state.operations.len()
                     );
-                    
+
                     let tree = tree_ref.value();
                     // Apply all operations to rebuild the tree
                     for operation in &tree_state.operations {
@@ -305,7 +305,6 @@ impl CacheAwarePolicy {
             }
         }
     }
-
 
     /// Run cache eviction to prevent unbounded growth
     pub fn evict_cache(&self, max_size: usize) {
@@ -382,7 +381,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     let worker_url = workers[min_load_idx].url();
                     // Now we can work with the tree without holding the HashMap lock
                     tree.insert(text, worker_url);
-                    
+
                     // Sync insert operation to HA
                     if let Some(ref ha_sync) = self.ha_sync {
                         use crate::ha::tree_ops::TreeInsertOp;
@@ -440,7 +439,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 if workers[selected_idx].is_healthy() {
                     // Update the tree with this request
                     tree.insert(text, &selected_url);
-                    
+
                     // Sync insert operation to HA
                     if let Some(ref ha_sync) = self.ha_sync {
                         use crate::ha::tree_ops::TreeInsertOp;
@@ -463,7 +462,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Selected worker no longer exists, remove it from tree
                 tree.remove_tenant(&selected_url);
                 debug!("Removed stale worker {} from cache tree", selected_url);
-                
+
                 // Sync removal to HA
                 if let Some(ref ha_sync) = self.ha_sync {
                     use crate::ha::tree_ops::TreeRemoveOp;

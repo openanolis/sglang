@@ -483,7 +483,11 @@ impl PolicyRegistry {
 
         // Also check default policy if it's cache-aware
         if self.default_policy.name() == "cache_aware" {
-            if let Some(cache_aware) = self.default_policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            if let Some(cache_aware) = self
+                .default_policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+            {
                 cache_aware.apply_remote_tree_operation(model_id, operation);
             }
         }
@@ -491,7 +495,9 @@ impl PolicyRegistry {
         // Check prefill and decode policies for PD mode
         if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
             if prefill_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) =
+                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
                     cache_aware.apply_remote_tree_operation(model_id, operation);
                 }
             }
@@ -499,7 +505,8 @@ impl PolicyRegistry {
 
         if let Some(decode_policy) = self.decode_policy.read().unwrap().as_ref() {
             if decode_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
                     cache_aware.apply_remote_tree_operation(model_id, operation);
                 }
             }

@@ -47,4 +47,3 @@ impl TreeState {
         self.version += 1;
     }
 }
-

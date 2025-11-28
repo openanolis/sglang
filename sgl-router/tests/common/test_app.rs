@@ -127,6 +127,8 @@ pub fn create_test_app_with_context(
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
+        ha_handler: None,
+        ha_sync_manager: None,
     });
 
     // Get config from the context
