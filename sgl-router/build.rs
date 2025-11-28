@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["src/mesh/proto/gossip.proto"], &["src/mesh/proto"])?;
 
-    println!("cargo:warning=Protobuf compilation completed successfully");
+    println!("cargo:info=Protobuf compilation completed successfully");
 
     Ok(())
 }
