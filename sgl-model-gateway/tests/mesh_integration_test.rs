@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use sgl_model_gateway::mesh::{
     crdt::SKey,
+    service::gossip::NodeStatus,
     stores::{
-        AppState, RateLimitConfig, StateStores, WorkerState, GLOBAL_RATE_LIMIT_COUNTER_KEY,
-        GLOBAL_RATE_LIMIT_KEY,
+        AppState, MembershipState, RateLimitConfig, StateStores, WorkerState,
+        GLOBAL_RATE_LIMIT_COUNTER_KEY, GLOBAL_RATE_LIMIT_KEY,
     },
     sync::MeshSyncManager,
     tree_ops::{TreeInsertOp, TreeOperation},
@@ -98,13 +99,36 @@ async fn test_node_join_and_leave() {
 
 #[tokio::test]
 async fn test_rate_limit_cluster_consistency() {
-    let manager1 = create_test_sync_manager("node1".to_string());
-    let manager2 = create_test_sync_manager("node2".to_string());
-    let manager3 = create_test_sync_manager("node3".to_string());
+    let stores1 = create_test_stores("node1".to_string());
+    let stores2 = create_test_stores("node2".to_string());
+    let stores3 = create_test_stores("node3".to_string());
 
-    // Setup membership for all nodes
-    // Note: In a real scenario, this would be done through membership store updates
-    // For testing, we'll use the stores directly through the sync manager's update method
+    // Setup membership for all nodes - add all nodes to membership store
+    let node_names = vec!["node1", "node2", "node3"];
+    for (stores, node_name) in [&stores1, &stores2, &stores3].iter().zip(node_names.iter()) {
+        let key = SKey::new(node_name.to_string());
+        stores.membership.insert(
+            key,
+            MembershipState {
+                name: node_name.to_string(),
+                address: format!(
+                    "127.0.0.1:{}",
+                    8000 + node_name.chars().last().unwrap().to_digit(10).unwrap()
+                ),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: std::collections::BTreeMap::new(),
+            },
+            node_name.to_string(),
+        );
+    }
+
+    // Create managers with stores that have membership
+    let manager1 = Arc::new(MeshSyncManager::new(stores1.clone(), "node1".to_string()));
+    let manager2 = Arc::new(MeshSyncManager::new(stores2.clone(), "node2".to_string()));
+    let manager3 = Arc::new(MeshSyncManager::new(stores3.clone(), "node3".to_string()));
+
+    // Update rate limit membership to include all nodes in hash ring
     manager1.update_rate_limit_membership();
     manager2.update_rate_limit_membership();
     manager3.update_rate_limit_membership();
@@ -114,12 +138,6 @@ async fn test_rate_limit_cluster_consistency() {
         limit_per_second: 100,
     };
     let serialized = serde_json::to_vec(&config).unwrap();
-    // Setup config through sync manager (using a helper that would normally be called)
-    // For testing, we'll create stores directly and use them
-    let stores1 = create_test_stores("node1".to_string());
-    let stores2 = create_test_stores("node2".to_string());
-    let stores3 = create_test_stores("node3".to_string());
-
     let key = SKey::new(GLOBAL_RATE_LIMIT_KEY.to_string());
     for stores in [&stores1, &stores2, &stores3] {
         stores.app.insert(
@@ -133,11 +151,6 @@ async fn test_rate_limit_cluster_consistency() {
         );
     }
 
-    // Recreate managers with updated stores
-    let manager1 = Arc::new(MeshSyncManager::new(stores1, "node1".to_string()));
-    let manager2 = Arc::new(MeshSyncManager::new(stores2, "node2".to_string()));
-    let manager3 = Arc::new(MeshSyncManager::new(stores3, "node3".to_string()));
-
     // Each node increments the counter (if it's an owner)
     let test_key = GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string();
 
@@ -146,8 +159,14 @@ async fn test_rate_limit_cluster_consistency() {
     manager3.sync_rate_limit_inc(test_key.clone(), 3);
 
     // Simulate counter merging (in real scenario, this happens via gossip)
-    // For test, we'll use the sync manager's apply method
-    // Note: This is a simplified test - in reality, merging happens through gossip protocol
+    // Merge counters from all nodes into manager1
+    // Get counters directly from stores since they're public
+    if let Some(counter2) = stores2.rate_limit.get_counter(&test_key) {
+        manager1.apply_remote_rate_limit_counter(test_key.clone(), &counter2);
+    }
+    if let Some(counter3) = stores3.rate_limit.get_counter(&test_key) {
+        manager1.apply_remote_rate_limit_counter(test_key.clone(), &counter3);
+    }
 
     // Check aggregated value
     let value = manager1.get_rate_limit_value(&test_key);
