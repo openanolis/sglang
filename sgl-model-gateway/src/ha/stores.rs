@@ -70,17 +70,10 @@ pub struct AppState {
 }
 
 /// Global rate limit configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RateLimitConfig {
+    /// Rate limit per second. 0 means disabled.
     pub limit_per_second: u64,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            limit_per_second: 0, // 0 means disabled
-        }
-    }
 }
 
 /// Key for global rate limit configuration in AppStore
