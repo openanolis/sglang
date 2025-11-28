@@ -188,7 +188,6 @@ impl IncrementalUpdateCollector {
             StoreType::RateLimit => {
                 // Collect rate limit counters from owners
                 let rate_limit_keys = self.stores.rate_limit.keys();
-                let mut last_sent = self.last_sent.write();
 
                 for key in rate_limit_keys {
                     // Only collect if this node is an owner
