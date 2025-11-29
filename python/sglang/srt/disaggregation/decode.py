@@ -400,7 +400,7 @@ class DecodePreallocQueue:
         )
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None and decode_req.rid not in rids_to_check:
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             if poll == KVPoll.Bootstrapping:
@@ -445,7 +445,7 @@ class DecodePreallocQueue:
         )
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.rid not in rids_to_check:
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 self.scheduler.stream_output(
@@ -456,7 +456,7 @@ class DecodePreallocQueue:
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.rid not in rids_to_check:
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             if i in indices_to_remove:
@@ -759,7 +759,7 @@ class DecodeTransferQueue:
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None and decode_req.rid not in rids_to_check:
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"

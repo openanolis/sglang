@@ -503,12 +503,13 @@ class SchedulerPPMixin:
             # send ready PP output to rank 0
             if mbs[next_first_rank_mb_id] is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                torch.cuda.current_stream().wait_event(q_event)
-                with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                    send_output_work = self._pp_send_dict_to_next_stage(
-                        pp_outputs_to_send.tensors,
-                        async_send=True,
-                    )
+                if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
+                    torch.cuda.current_stream().wait_event(q_event)
+                    with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                        send_output_work = self._pp_send_dict_to_next_stage(
+                            pp_outputs_to_send.tensors,
+                            async_send=True,
+                        )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
             if pp_outputs:
@@ -540,14 +541,19 @@ class SchedulerPPMixin:
 
         if mbs[next_mb_id] is not None:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
-            with self.copy_stream_ctx:
-                self.copy_stream.wait_stream(self.default_stream)
-                batch_result = self._pp_prep_batch_result(
-                    mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
-                )
-                d2h_event = torch.cuda.Event()
-                d2h_event.record(torch.cuda.current_stream())
+                next_pp_outputs = None
+                if not mbs[next_mb_id].forward_mode.is_prebuilt():
+                    next_pp_outputs = PPProxyTensors(
+                        self._pp_recv_dict_from_prev_stage()
+                    )
+            if not mbs[next_mb_id].forward_mode.is_prebuilt():
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.default_stream)
+                    batch_result = self._pp_prep_batch_result(
+                        mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+                    )
+                    d2h_event = torch.cuda.Event()
+                    d2h_event.record(torch.cuda.current_stream())
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
@@ -580,20 +586,20 @@ class SchedulerPPMixin:
         return result, event
 
     def get_rids(
-        self: Scheduler, req_queue: List[Req], sender: bool, *poll_statuses_group
+        self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
     ):
         """
         Used by PP, get the required rids with the given poll statuses.
         """
         polls = poll_and_all_reduce(
-            [req.disagg_kv_sender if sender else req.kv_receiver for req in req_queue],
+            [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
             self.tp_worker.get_attention_tp_cpu_group(),
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:
             rids.append(
                 [
-                    req.rid
+                    req.rid if is_send else req.req.rid
                     for req, poll in zip(req_queue, polls)
                     if poll in poll_statuses
                 ]
@@ -1095,7 +1101,7 @@ class SchedulerPPMixin:
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue,
+                self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
             )
@@ -1106,7 +1112,7 @@ class SchedulerPPMixin:
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue,
+                self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
             )
@@ -1118,12 +1124,14 @@ class SchedulerPPMixin:
 
     # from process_decode_queue
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
-        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs, has_retracted_req = (
-            self.disagg_decode_prealloc_queue.resume_retracted_reqs(retract_rids)
-        )
-        self.waiting_queue.extend(resumed_reqs)
-        return [req.rid for req in resumed_reqs], has_retracted_req
+        if retract_rids is not None:
+            # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+            resumed_reqs, has_retracted_req = (
+                self.disagg_decode_prealloc_queue.resume_retracted_reqs(retract_rids)
+            )
+            self.waiting_queue.extend(resumed_reqs)
+            return [req.rid for req in resumed_reqs], has_retracted_req
+        return None, False
 
     # from process_decode_queue
     def process_prealloc_queue(
@@ -1146,7 +1154,10 @@ class SchedulerPPMixin:
                 + bad_consensus_prealloc_rids,
             )
             self.disagg_decode_transfer_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            return [
+                [req.req.rid for req in good_reqs],
+                [req.req.rid for req in failed_reqs],
+            ]
         return None
 
     def process_decode_transfer_queue(
@@ -1208,9 +1219,9 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
-                next_release_rids = None
-                next_consensus_prealloc_rids = None
                 next_consensus_retract_rids = None
+                next_consensus_prealloc_rids = None
+                next_release_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -1241,7 +1252,9 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = None
+                    if not self.cur_batch.forward_mode.is_prebuilt():
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -1310,9 +1323,7 @@ class SchedulerPPMixin:
                 if rmbs[next_mb_id] is not None:
                     next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
                     next_consensus_retract_rids, has_retracted_req = (
-                        self.process_retract_queue(  # TODO: implement this
-                            next_consensus_retract_rids
-                        )
+                        self.process_retract_queue(next_consensus_retract_rids)
                     )
                 self._pp_commit_comm_work(send_consensus_retract_work)
 
@@ -1332,16 +1343,20 @@ class SchedulerPPMixin:
 
                 # post-process the coming microbatch
                 if mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        mbs[next_mb_id],
-                        next_batch_result,
-                    )
+                    if not mbs[next_mb_id].forward_mode.is_prebuilt():
+                        d2h_event.synchronize()
+                        self._pp_process_batch_result(
+                            mbs[next_mb_id],
+                            next_batch_result,
+                        )
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
                     send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
+                    )
+                    send_retract_work = self._pp_send_pyobj_to_next_stage(
+                        retract_rids, async_send=True
                     )
                     send_prealloc_work = self._pp_send_pyobj_to_next_stage(
                         prealloc_rids, async_send=True
@@ -1349,7 +1364,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.cur_batch:
+                    if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
                         torch.cuda.current_stream().wait_event(event)
                         send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
@@ -1362,12 +1377,21 @@ class SchedulerPPMixin:
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
+                consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle and len(self.disagg_decode_transfer_queue) == 0:
+            queue_size = (
+                len(self.waiting_queue)
+                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+            )
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                queue_size += len(self.decode_offload_manager.ongoing_offload)
+
+            if server_is_idle and queue_size == 0:
                 self.check_memory()
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
