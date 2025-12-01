@@ -104,7 +104,7 @@ async fn test_rate_limit_cluster_consistency() {
     let stores3 = create_test_stores("node3".to_string());
 
     // Setup membership for all nodes - add all nodes to membership store
-    let node_names = vec!["node1", "node2", "node3"];
+    let node_names = ["node1", "node2", "node3"];
     for (stores, node_name) in [&stores1, &stores2, &stores3].iter().zip(node_names.iter()) {
         let key = SKey::new(node_name.to_string());
         stores.membership.insert(
