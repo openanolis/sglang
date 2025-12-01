@@ -529,7 +529,10 @@ mod tests {
         log::info!("================================================");
 
         // 5. wait for node status to sync
-        tokio::time::sleep(Duration::from_secs(8)).await;
+        // Node E needs to go through two ping failures (Alive -> Suspected -> Down)
+        // and the status needs to be broadcast and synced across all nodes
+        // Each gossip round is 1 second, so we need at least 2 rounds + broadcast time
+        tokio::time::sleep(Duration::from_secs(15)).await;
         log::info!("================================================");
 
         // 6. verify node status, status of all nodes should be same, and node E should be down
