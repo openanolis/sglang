@@ -403,6 +403,8 @@ pub enum WorkerType {
     },
     /// Decode worker for PD disaggregated mode
     Decode,
+    /// Encode worker for EPD disaggregated mode
+    Encode,
 }
 
 impl fmt::Display for WorkerType {
@@ -414,6 +416,7 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+            WorkerType::Encode => write!(f, "Encode"),
         }
     }
 }
@@ -1118,6 +1121,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         WorkerType::Regular => "regular",
         WorkerType::Prefill { .. } => "prefill",
         WorkerType::Decode => "decode",
+        WorkerType::Encode => "encode",
     };
 
     let bootstrap_port = match worker_type {
