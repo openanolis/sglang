@@ -302,7 +302,6 @@ class OpenAIServingRealtime(OpenAIServingBase):
         self, websocket: WebSocket, model: Optional[str] = None
     ):
         """Handle WebSocket connection."""
-        await websocket.accept()
         session_id = f"session_{uuid.uuid4().hex[:16]}"
         session = RealtimeSession(
             session_id, self.tokenizer_manager, self.template_manager, model=model
