@@ -41,7 +41,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -284,6 +284,25 @@ async def lifespan(fast_api_app: FastAPI):
     except Exception:
         traceback = get_exception_traceback()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
+
+    # Store API key in app state for WebSocket subprotocol validation
+    fast_api_app.state.api_key = server_args.api_key
+
+    # Initialize Realtime API handler
+    try:
+        from sglang.srt.entrypoints.openai.serving_realtime import (
+            OpenAIServingRealtime,
+        )
+
+        fast_api_app.state.openai_serving_realtime = OpenAIServingRealtime(
+            _global_state.tokenizer_manager,
+            _global_state.template_manager,
+        )
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.warning(
+            f"Can not initialize OpenAIServingRealtime, error: {traceback}"
+        )
 
     # Execute custom warmups
     if server_args.warmups is not None:
@@ -1309,6 +1328,86 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     return await raw_request.app.state.openai_serving_rerank.handle_request(
         request, raw_request
     )
+
+
+@app.websocket("/v1/realtime")
+async def v1_realtime_websocket(websocket: WebSocket):
+    """OpenAI Realtime API WebSocket endpoint."""
+    logger.debug("WebSocket connection attempt received")
+
+    # Get requested subprotocols from client
+    # FastAPI/Starlette stores subprotocols in websocket.scope["subprotocols"]
+    requested_subprotocols = websocket.scope.get("subprotocols", [])
+    logger.debug(f"Requested subprotocols: {requested_subprotocols}")
+    
+    # Supported subprotocols
+    # According to OpenAI Realtime API spec:
+    # 1. 'realtime' - basic realtime protocol
+    # 2. 'openai-insecure-api-key.${apiKey}' - with API key authentication
+    # 3. 'openai-beta.realtime-v1' - beta version
+    SUPPORTED_SUBPROTOCOLS = [
+        "openai-beta.realtime-v1",
+        "realtime",
+    ]
+    
+    # Get API key from app state for validation
+    api_key = getattr(websocket.app.state, "api_key", None)
+    
+    # Select the first matching subprotocol (in order of client's request)
+    # This matches the client's priority: realtime, openai-insecure-api-key.${apiKey}, openai-beta.realtime-v1
+    selected_subprotocol = None
+    for requested in requested_subprotocols:
+        # Check for openai-insecure-api-key.${apiKey} format
+        if requested.startswith("openai-insecure-api-key."):
+            # Extract the API key from the subprotocol
+            requested_api_key = requested[len("openai-insecure-api-key."):]
+            # Validate API key: if server has one configured, it must match; if not, accept any
+            if api_key is None or requested_api_key == api_key:
+                selected_subprotocol = requested
+                logger.debug(f"Selected subprotocol: {selected_subprotocol} (API key {'validated' if api_key else 'not required'})")
+                break
+        # Check for other supported subprotocols
+        elif requested in SUPPORTED_SUBPROTOCOLS:
+            selected_subprotocol = requested
+            logger.debug(f"Selected subprotocol: {selected_subprotocol}")
+            break
+    
+    model = websocket.query_params.get("model")
+    if not model:
+        model = websocket.app.state.tokenizer_manager.served_model_name if hasattr(websocket.app.state, "tokenizer_manager") else None
+    
+    logger.debug(f"WebSocket connection with model: {model}, subprotocol: {selected_subprotocol}")
+    
+    # Accept WebSocket connection with selected subprotocol
+    # The HTTP middleware may not intercept WebSocket upgrade requests reliably
+    try:
+        if selected_subprotocol:
+            await websocket.accept(subprotocol=selected_subprotocol)
+            logger.debug(f"WebSocket connection accepted with subprotocol: {selected_subprotocol}")
+        else:
+            # If no matching subprotocol, still accept but without subprotocol
+            # This provides backward compatibility
+            await websocket.accept()
+            logger.debug("WebSocket connection accepted without subprotocol")
+    except Exception as e:
+        logger.error(f"Failed to accept WebSocket connection: {e}")
+        return
+    
+    if not hasattr(websocket.app.state, "openai_serving_realtime"):
+        # Log the error for debugging
+        logger.error("OpenAIServingRealtime not initialized. Check server startup logs for initialization errors.")
+        # Use WebSocket close code 1011 (Internal Error) instead of HTTP 503
+        try:
+            await websocket.close(code=1011, reason="Realtime API not available")
+        except Exception as e:
+            logger.error(f"Failed to close WebSocket: {e}")
+        return
+    
+    try:
+        logger.debug(f"Calling handle_websocket with model: {model}")
+        await websocket.app.state.openai_serving_realtime.handle_websocket(websocket, model=model)
+    except Exception as e:
+        logger.exception(f"Error in handle_websocket: {e}")
 
 
 ## SageMaker API

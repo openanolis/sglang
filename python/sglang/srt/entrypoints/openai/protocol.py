@@ -1226,6 +1226,287 @@ class ResponseReasoningTextContent(BaseModel):
     type: Literal["reasoning_text"] = "reasoning_text"
 
 
-ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
+class RealtimeAudioFormat(BaseModel):
+    """Audio format specification."""
+    type: Literal["audio/pcm", "audio/pcmu", "audio/pcma"]
+    rate: Optional[int] = 24000
+
+
+class RealtimeTurnDetection(BaseModel):
+    """Turn detection configuration."""
+    type: str  # e.g., "server_vad"
+    threshold: Optional[float] = None
+    prefix_padding_ms: Optional[int] = None
+    silence_duration_ms: Optional[int] = None
+    idle_timeout_ms: Optional[int] = None
+    create_response: Optional[bool] = None
+    interrupt_response: Optional[bool] = None
+
+
+class RealtimeNoiseReduction(BaseModel):
+    """Configuration for input audio noise reduction."""
+
+    type: Optional[Literal["near_field", "far_field"]]
+
+
+class RealtimeAudioInput(BaseModel):
+    """Audio input configuration."""
+    format: RealtimeAudioFormat
+    # transcription: Optional[Any] = None
+    noise_reduction: Optional[RealtimeNoiseReduction] = None
+    # turn_detection: Optional[RealtimeTurnDetection] = None
+
+
+class RealtimeAudioOutput(BaseModel):
+    """Audio output configuration."""
+    format: RealtimeAudioFormat
+    voice: Optional[str] = None
+    speed: Optional[float] = 1.0
+
+
+class RealtimeAudioConfig(BaseModel):
+    """Audio configuration containing input and output settings."""
+    input: RealtimeAudioInput
+    output: RealtimeAudioOutput
+
+
+class RealtimeTool(BaseModel):
+    """Tool configuration."""
+
+    type: Optional[str] = None  # e.g., "function"
+    function: Optional[Function] = None
+
+
+class RealtimeSessionConfiguration(BaseModel):
+    """Session configuration for Realtime API.
+    
+    According to OpenAI Realtime API spec:
+    https://github.com/openai/openai-realtime-api-beta/blob/main/lib/client.js
+    
+    Based on SessionResourceType from the official client:
+    - Used for session.update (client -> server)
+    - Used for session.created/updated (server -> client)
+    - Fields match the JavaScript SessionResourceType definition
+    """
+    
+    # Metadata fields (for session.created/updated events)
+    type: Optional[Literal["realtime"]] = "realtime"
+    object: Optional[Literal["realtime.session"]] = "realtime.session"
+    id: Optional[str] = None
+    expires_at: Optional[int] = None  # Unix timestamp
+    audio: Optional[RealtimeAudioConfig] = None
+    include: Optional[Any] = None
+    
+    # Session configuration fields (from SessionResourceType)
+    model: Optional[str] = None
+    modalities: Optional[List[Literal["text", "audio"]]] = None  # Client uses "modalities", server may use "output_modalities"
+    instructions: Optional[str] = None
+    voice: Optional[Literal["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"]] = None
+    input_audio_format: Optional[Literal["pcm16", "g711_ulaw", "g711_alaw"]] = None
+    output_audio_format: Optional[Literal["pcm16", "g711_ulaw", "g711_alaw"]] = None
+    input_audio_transcription: Optional[Dict[str, Any]] = None  # e.g., {"model": "whisper-1"}
+    turn_detection: Optional[Dict[str, Any]] = None  # e.g., {"type": "server_vad", "threshold": 0.5, ...}
+    tools: Optional[List[RealtimeTool]] = None
+    tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = None
+    temperature: Optional[float] = None
+    max_response_output_tokens: Optional[Union[int, Literal["inf"]]] = None  # Client uses this name
+    max_output_tokens: Optional[Union[int, Literal["inf"]]] = None  # Server response field
+    
+
+class RealtimeSessionCreatedEvent(BaseModel):
+    """Session created event - sent by server when WebSocket connection is established.
+
+    According to OpenAI Realtime API spec:
+    https://platform.openai.com/docs/api-reference/realtime-server-events/session/created
+    """
+
+    type: Literal["session.created"] = "session.created"
+    event_id: Optional[str] = None
+    session: RealtimeSessionConfiguration
+
+
+class RealtimeSessionUpdateEvent(BaseModel):
+    """Session update event - sent by client to update session settings."""
+
+    type: Literal["session.update"] = "session.update"
+    session: RealtimeSessionConfiguration
+
+
+class RealtimeSessionUpdatedEvent(BaseModel):
+    """Session updated event - sent by server in response to session.update."""
+
+    type: Literal["session.updated"] = "session.updated"
+    event_id: Optional[str] = None
+    session: RealtimeSessionConfiguration
+
+
+class RealtimeInputAudioBufferAppendEvent(BaseModel):
+    """Input audio buffer append event."""
+
+    type: Literal["input_audio_buffer.append"] = "input_audio_buffer.append"
+    audio: str  # Base64 encoded audio data
+
+
+class RealtimeInputAudioBufferClearEvent(BaseModel):
+    """Input audio buffer clear event."""
+
+    type: Literal["input_audio_buffer.clear"] = "input_audio_buffer.clear"
+
+
+class RealtimeInputAudioBufferCommitEvent(BaseModel):
+    """Input audio buffer commit event."""
+
+    type: Literal["input_audio_buffer.commit"] = "input_audio_buffer.commit"
+
+
+class RealtimeResponseCreateEvent(BaseModel):
+    """Response create event."""
+
+    type: Literal["response.create"] = "response.create"
+    event_id: Optional[str] = None
+    response: Optional[Dict[str, Any]] = None
+
+
+class RealtimeResponseAudioDeltaEvent(BaseModel):
+    """Response audio delta event."""
+
+    type: Literal["response.audio.delta"] = "response.audio.delta"
+    event_id: Optional[str] = None
+    item_id: str  # ID of the conversation item
+    content_index: int  # Index of the content part within the item
+    delta: str  # Base64 encoded audio chunk
+
+
+class RealtimeResponseAudioTranscriptDeltaEvent(BaseModel):
+    """Response audio transcript delta event."""
+
+    type: Literal["response.audio_transcript.delta"] = "response.audio_transcript.delta"
+    event_id: Optional[str] = None
+    item_id: str  # ID of the conversation item
+    content_index: int  # Index of the content part within the item
+    delta: str  # Text delta
+
+
+class RealtimeResponseAudioTranscriptDoneEvent(BaseModel):
+    """Response audio transcript done event."""
+
+    type: Literal["response.audio_transcript.done"] = "response.audio_transcript.done"
+    event_id: Optional[str] = None
+    transcript: str
+
+
+class RealtimeResponseContentPartAddedEvent(BaseModel):
+    """Response content part added event."""
+
+    type: Literal["response.content_part.added"] = "response.content_part.added"
+    event_id: Optional[str] = None
+    item_id: str  # ID of the conversation item
+    part: Dict[str, Any]  # Content part to add (e.g., {"type": "text", "text": ""})
+
+
+class RealtimeResponseTextDeltaEvent(BaseModel):
+    """Response text delta event."""
+
+    type: Literal["response.text.delta"] = "response.text.delta"
+    event_id: Optional[str] = None
+    item_id: str  # ID of the conversation item
+    content_index: int  # Index of the content part within the item
+    delta: str  # Text delta
+
+
+class RealtimeResponseOutputItemDoneEvent(BaseModel):
+    """Response output item done event."""
+
+    type: Literal["response.output_item.done"] = "response.output_item.done"
+    event_id: Optional[str] = None
+    item: Dict[str, Any]  # Item with id and status (e.g., {"id": "item_xxx", "status": "completed"})
+
+
+class RealtimeErrorEvent(BaseModel):
+    """Error event."""
+
+    type: Literal["error"] = "error"
+    event_id: Optional[str] = None
+    error: Dict[str, Any]
+
+
+class RealtimeSystemMessageItemContent(BaseModel):
+    text: str
+    type: Literal["input_text"] = "input_text"
+
+
+class RealtimeSystemMessageItem(BaseModel):
+    """A system message in a Realtime conversation can be used."""
+
+    content: List[RealtimeSystemMessageItemContent]
+    role: Literal["system"] = "system"
+    type: Literal["message"] = "message"
+    id: Optional[str] = None
+    object: Optional[Literal["realtime.item"]] = None
+    status: str
+
+
+class RealtimeUserMessageItemContent(BaseModel):
+    audio: str  # based64-encoded audio bytes
+    detail: str
+    image_url: str  # base64-encoded image byte
+    text: str
+    transcript: str
+    type: Literal["input_audio", "input_image", "input_text"]
+
+
+class RealtimeUserMessageItem(BaseModel):
+    """A user message in a Realtime conversation can be used."""
+
+    content: List[RealtimeUserMessageItemContent]
+    role: Literal["user"] = "user"
+    type: Literal["message"] = "message"
+    id: Optional[str] = None
+    object: Optional[Literal["realtime.item"]] = None
+    status: str
+
+
+class RealtimeConversationItemCreatedEvent(BaseModel):
+    """Conversation item created event."""
+
+    event_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    type: Literal["conversation.item.created"] = "conversation.item.created"
+    item: Dict[str, Any]
+
+
+class RealtimeConversationItemInputAudioTranscriptionCompletedEvent(BaseModel):
+    """Conversation item input audio transcription completed event."""
+
+    type: Literal[
+        "conversation.item.input_audio_transcription.completed"
+    ] = "conversation.item.input_audio_transcription.completed"
+    event_id: Optional[str] = None
+    item_id: str
+    transcript: str
+
+
+# Union type for all client events
+RealtimeClientEvent = Union[
+    RealtimeSessionUpdateEvent,
+    RealtimeInputAudioBufferAppendEvent,
+    RealtimeInputAudioBufferClearEvent,
+    RealtimeInputAudioBufferCommitEvent,
+    RealtimeResponseCreateEvent,
+]
+
+# Union type for all server events
+RealtimeServerEvent = Union[
+    RealtimeSessionCreatedEvent,
+    RealtimeSessionUpdatedEvent,
+    RealtimeResponseCreateEvent,
+    RealtimeResponseContentPartAddedEvent,
+    RealtimeResponseAudioDeltaEvent,
+    RealtimeResponseAudioTranscriptDeltaEvent,
+    RealtimeResponseAudioTranscriptDoneEvent,
+    RealtimeResponseTextDeltaEvent,
+    RealtimeResponseOutputItemDoneEvent,
+    RealtimeErrorEvent,
+    RealtimeConversationItemCreatedEvent,
+    RealtimeConversationItemInputAudioTranscriptionCompletedEvent,
 ]
