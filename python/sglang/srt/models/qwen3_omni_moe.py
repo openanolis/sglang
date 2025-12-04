@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import math
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -35,7 +36,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import (
@@ -424,12 +425,23 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
         self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
-        self.visual = Qwen3OmniMoeVisionEncoder(
-            config.vision_config,
-            quant_config=quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
-        )
+        
+        # Replace parent's visual with Qwen3OmniMoeVisionEncoder if vision is not skipped
+        skip_vision = os.getenv("SGLANG_SKIP_VISION_MODULE", "0") == "1"
+        if not skip_vision and self.visual is not None:
+            # Replace parent's Qwen3VLMoeVisionModel with Qwen3OmniMoeVisionEncoder
+            self.visual = Qwen3OmniMoeVisionEncoder(
+                config.vision_config,
+                quant_config=quant_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("visual", prefix),
+            )
+            # Update deepstack attributes if visual was created
+            if self.visual is not None:
+                self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+                self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+                self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        
         self.pad_token_id = (
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
         )

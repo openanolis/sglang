@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import os
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -601,15 +602,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        
+        # Check if vision module should be skipped
+        skip_vision = os.getenv("SGLANG_SKIP_VISION_MODULE", "0") == "1"
+        if skip_vision:
+            logger.info("Skipping vision module initialization (SGLANG_SKIP_VISION_MODULE=1)")
+            self.visual = None
+            self.deepstack_visual_indexes = []
+            self.num_deepstack_embeddings = 0
+            self.use_deepstack = {}
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+            # deepstack
+            self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+            self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -638,11 +653,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
-
-        # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
     def separate_deepstack_embeds(self, embedding):
         assert (
