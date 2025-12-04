@@ -1196,8 +1196,21 @@ def add_api_key_middleware(app, api_key: str):
             "/metrics"
         ):
             return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
+        
+        # Check if this is a WebSocket upgrade request
+        is_websocket = request.headers.get("Upgrade", "").lower() == "websocket"
+        
+        # Verify Authorization header
+        auth_header = request.headers.get("Authorization")
+        if auth_header != "Bearer " + api_key:
+            # For WebSocket connections, return 403 Forbidden (connection rejected)
+            if is_websocket:
+                return ORJSONResponse(
+                    content={"error": "Forbidden"}, status_code=403
+                )
+            # For regular HTTP requests, return 401 Unauthorized
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
+        
         return await call_next(request)
 
 
