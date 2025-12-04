@@ -90,7 +90,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             RoutingMode::EncodePrefillDecode { .. } => {
                 let has_encode = healthy_workers
                     .iter()
-                    .any(|w| matches!(w.worker_type(), WorkerType::Encode));
+                    .any(|w| matches!(w.worker_type(), WorkerType::Encode { .. }));
                 let has_prefill = healthy_workers
                     .iter()
                     .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
@@ -517,6 +517,7 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
         "total": workers.len(),
         "stats": {
             "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
+            "encode_count": state.context.worker_registry.get_encode_workers().len(),
             "decode_count": state.context.worker_registry.get_decode_workers().len(),
             "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
         }
