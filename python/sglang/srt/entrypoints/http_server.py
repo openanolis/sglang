@@ -41,7 +41,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -284,6 +284,22 @@ async def lifespan(fast_api_app: FastAPI):
     except Exception:
         traceback = get_exception_traceback()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
+
+    # Initialize Realtime API handler
+    try:
+        from sglang.srt.entrypoints.openai.serving_realtime import (
+            OpenAIServingRealtime,
+        )
+
+        fast_api_app.state.openai_serving_realtime = OpenAIServingRealtime(
+            _global_state.tokenizer_manager,
+            _global_state.template_manager,
+        )
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.warning(
+            f"Can not initialize OpenAIServingRealtime, error: {traceback}"
+        )
 
     # Execute custom warmups
     if server_args.warmups is not None:
@@ -1309,6 +1325,16 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     return await raw_request.app.state.openai_serving_rerank.handle_request(
         request, raw_request
     )
+
+
+@app.websocket("/v1/realtime")
+async def v1_realtime_websocket(websocket: WebSocket):
+    """OpenAI Realtime API WebSocket endpoint."""
+    if not hasattr(websocket.app.state, "openai_serving_realtime"):
+        await websocket.close(code=503, reason="Realtime API not available")
+        return
+    
+    await websocket.app.state.openai_serving_realtime.handle_websocket(websocket)
 
 
 ## SageMaker API

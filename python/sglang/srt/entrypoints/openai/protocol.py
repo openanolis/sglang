@@ -1226,6 +1226,146 @@ class ResponseReasoningTextContent(BaseModel):
     type: Literal["reasoning_text"] = "reasoning_text"
 
 
-ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
+# ==============================================================================
+# OpenAI Realtime API Protocol Definitions
+# ==============================================================================
+
+
+class RealtimeSessionSettings(BaseModel):
+    """Session settings for Realtime API."""
+
+    modalities: Optional[List[Literal["text", "audio"]]] = ["text", "audio"]
+    instructions: Optional[str] = None
+    voice: Optional[Literal["alloy", "echo", "fable", "onyx", "nova", "shimmer"]] = None
+    input_audio_format: Optional[Literal["pcm16", "g711_ulaw", "g711_alaw", "opus"]] = "pcm16"
+    output_audio_format: Optional[Literal["pcm16", "g711_ulaw", "g711_alaw", "opus"]] = "pcm16"
+    input_audio_transcription: Optional[Dict[str, Any]] = None
+    turn_detection: Optional[Dict[str, Any]] = None
+    temperature: Optional[float] = None
+    max_response_output_tokens: Optional[int] = None
+    tools: Optional[List[Tool]] = None
+    tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = None
+    response_format: Optional[ResponseFormat] = None
+
+
+class RealtimeSessionUpdateEvent(BaseModel):
+    """Session update event."""
+
+    type: Literal["session.update"] = "session.update"
+    session: RealtimeSessionSettings
+
+
+class RealtimeInputAudioBufferAppendEvent(BaseModel):
+    """Input audio buffer append event."""
+
+    type: Literal["input_audio_buffer.append"] = "input_audio_buffer.append"
+    audio: str  # Base64 encoded audio data
+
+
+class RealtimeInputAudioBufferClearEvent(BaseModel):
+    """Input audio buffer clear event."""
+
+    type: Literal["input_audio_buffer.clear"] = "input_audio_buffer.clear"
+
+
+class RealtimeInputAudioBufferCommitEvent(BaseModel):
+    """Input audio buffer commit event."""
+
+    type: Literal["input_audio_buffer.commit"] = "input_audio_buffer.commit"
+
+
+class RealtimeResponseCreateEvent(BaseModel):
+    """Response create event."""
+
+    type: Literal["response.create"] = "response.create"
+    response: Optional[Dict[str, Any]] = None
+
+
+class RealtimeResponseAudioDeltaEvent(BaseModel):
+    """Response audio delta event."""
+
+    type: Literal["response.audio.delta"] = "response.audio.delta"
+    delta: str  # Base64 encoded audio chunk
+
+
+class RealtimeResponseAudioTranscriptDeltaEvent(BaseModel):
+    """Response audio transcript delta event."""
+
+    type: Literal["response.audio_transcript.delta"] = "response.audio_transcript.delta"
+    delta: str  # Text delta
+
+
+class RealtimeResponseAudioTranscriptDoneEvent(BaseModel):
+    """Response audio transcript done event."""
+
+    type: Literal["response.audio_transcript.done"] = "response.audio_transcript.done"
+    transcript: str
+
+
+class RealtimeResponseTextDeltaEvent(BaseModel):
+    """Response text delta event."""
+
+    type: Literal["response.text.delta"] = "response.text.delta"
+    delta: str  # Text delta
+
+
+class RealtimeResponseTextDoneEvent(BaseModel):
+    """Response text done event."""
+
+    type: Literal["response.text.done"] = "response.text.done"
+    text: str
+
+
+class RealtimeResponseDoneEvent(BaseModel):
+    """Response done event."""
+
+    type: Literal["response.done"] = "response.done"
+    response: Optional[Dict[str, Any]] = None
+
+
+class RealtimeErrorEvent(BaseModel):
+    """Error event."""
+
+    type: Literal["error"] = "error"
+    error: Dict[str, Any]
+
+
+class RealtimeConversationItemCreatedEvent(BaseModel):
+    """Conversation item created event."""
+
+    type: Literal["conversation.item.created"] = "conversation.item.created"
+    item: Dict[str, Any]
+
+
+class RealtimeConversationItemInputAudioTranscriptionCompletedEvent(BaseModel):
+    """Conversation item input audio transcription completed event."""
+
+    type: Literal[
+        "conversation.item.input_audio_transcription.completed"
+    ] = "conversation.item.input_audio_transcription.completed"
+    item_id: str
+    transcript: str
+
+
+# Union type for all client events
+RealtimeClientEvent = Union[
+    RealtimeSessionUpdateEvent,
+    RealtimeInputAudioBufferAppendEvent,
+    RealtimeInputAudioBufferClearEvent,
+    RealtimeInputAudioBufferCommitEvent,
+    RealtimeResponseCreateEvent,
+]
+
+# Union type for all server events
+RealtimeServerEvent = Union[
+    RealtimeResponseCreateEvent,
+    RealtimeResponseAudioDeltaEvent,
+    RealtimeResponseAudioTranscriptDeltaEvent,
+    RealtimeResponseAudioTranscriptDoneEvent,
+    RealtimeResponseTextDeltaEvent,
+    RealtimeResponseTextDoneEvent,
+    RealtimeResponseDoneEvent,
+    RealtimeErrorEvent,
+    RealtimeConversationItemCreatedEvent,
+    RealtimeConversationItemInputAudioTranscriptionCompletedEvent,
 ]
