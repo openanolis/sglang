@@ -133,7 +133,6 @@ class OpenAIServingRealtime(OpenAIServingBase):
 
     async def handle_websocket(self, websocket: WebSocket):
         """Handle WebSocket connection."""
-        await websocket.accept()
         session_id = f"session_{uuid.uuid4().hex[:16]}"
         session = RealtimeSession(
             session_id, self.tokenizer_manager, self.template_manager

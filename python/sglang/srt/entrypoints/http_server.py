@@ -1330,6 +1330,10 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
 @app.websocket("/v1/realtime")
 async def v1_realtime_websocket(websocket: WebSocket):
     """OpenAI Realtime API WebSocket endpoint."""
+    # Directly accept the WebSocket connection without authentication check
+    # The HTTP middleware may not intercept WebSocket upgrade requests reliably
+    await websocket.accept()
+    
     if not hasattr(websocket.app.state, "openai_serving_realtime"):
         await websocket.close(code=503, reason="Realtime API not available")
         return
