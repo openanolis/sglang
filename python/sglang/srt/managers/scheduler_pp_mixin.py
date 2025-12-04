@@ -1056,13 +1056,19 @@ class SchedulerPPMixin:
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
 
-    def _pp_pd_get_retract_ids(self: Scheduler):
+    def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
         # communicate pre-consensus retracted reqs
+        for req in self.disagg_decode_prealloc_queue.retracted_queue:
+            # assign retracted reqs to the current microbatch
+            if req.retraction_mb_id is None:
+                req.retraction_mb_id = mb_id
         curr_retract_rids = [
-            req.rid for req in self.disagg_decode_prealloc_queue.retracted_queue
+            req.rid
+            for req in self.disagg_decode_prealloc_queue.retracted_queue
+            if req.retraction_mb_id == mb_id
         ]
         if self.pp_group.is_first_rank:
-            # First rank, get all retracted req ids
+            # First rank, get all retracted req ids for the microbatch
             return curr_retract_rids
         else:
             # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
@@ -1122,27 +1128,20 @@ class SchedulerPPMixin:
             )
         return transferred_rids
 
-    # from process_decode_queue
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
             # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-            resumed_reqs, has_retracted_req = (
-                self.disagg_decode_prealloc_queue.resume_retracted_reqs(retract_rids)
+            resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
+                retract_rids
             )
             self.waiting_queue.extend(resumed_reqs)
-            return [req.rid for req in resumed_reqs], has_retracted_req
-        return None, False
+            return [req.rid for req in resumed_reqs]
+        return None
 
-    # from process_decode_queue
-    def process_prealloc_queue(
-        self: Scheduler, prealloc_rids: Optional[List[str]], has_retracted_req: bool
-    ):
-        if has_retracted_req:
+    def process_prealloc_queue(self: Scheduler, prealloc_rids: Optional[List[str]]):
+        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
-            return None
-
-        # TODO: figure out if we need polling_count, probably do not since we do not need to poll
-        # in particular we do not call _update_handshake_waiters
+            return [[], []]
 
         if prealloc_rids is not None:
             (
@@ -1189,10 +1188,10 @@ class SchedulerPPMixin:
         # consensus rids
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str]] = None
+        release_rids: Optional[List[str]] = None  # consensus transferred rids
 
         rmbs = [None] * self.pp_loop_size
-        bmbs = [None] * self.pp_loop_size
+        pmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
 
         send_req_work = []
@@ -1232,12 +1231,12 @@ class SchedulerPPMixin:
                     self._pp_commit_comm_work(send_req_work)
 
                 # reaching consensus through PP ranks
-                retract_rids = self._pp_pd_get_retract_ids()
+                retract_rids = self._pp_pd_get_retract_ids(mb_id)
                 rmbs[mb_id] = retract_rids
                 self._pp_commit_comm_work(send_retract_work)
 
                 prealloc_rids = self._pp_pd_get_prealloc_ids()
-                bmbs[mb_id] = prealloc_rids
+                pmbs[mb_id] = prealloc_rids
                 self._pp_commit_comm_work(send_prealloc_work)
 
                 transferred_rids = self._pp_pd_get_decode_transferred_ids()
@@ -1302,7 +1301,7 @@ class SchedulerPPMixin:
 
                 send_consensus_prealloc_work, consensus_prealloc_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(  # reuse the function
-                        bmbs,
+                        pmbs,
                         next_first_rank_mb_id,
                         consensus_prealloc_rids,
                         prealloc_rids,
@@ -1315,22 +1314,20 @@ class SchedulerPPMixin:
                     )
                 )
 
-                # from process_decode_queue
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
-                has_retracted_req = False
                 if rmbs[next_mb_id] is not None:
                     next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_retract_rids, has_retracted_req = (
-                        self.process_retract_queue(next_consensus_retract_rids)
+                    next_consensus_retract_rids = self.process_retract_queue(
+                        next_consensus_retract_rids
                     )
                 self._pp_commit_comm_work(send_consensus_retract_work)
 
-                if bmbs[next_mb_id] is not None:
+                if pmbs[next_mb_id] is not None:
                     next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
                     next_consensus_prealloc_rids = self.process_prealloc_queue(
-                        next_consensus_prealloc_rids, has_retracted_req
+                        next_consensus_prealloc_rids
                     )
                 self._pp_commit_comm_work(send_consensus_prealloc_work)
 

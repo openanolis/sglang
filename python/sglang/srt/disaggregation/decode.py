@@ -234,7 +234,6 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.decode_tp_size = attn_tp_size
-        # Note(shangming): pp is not supported on the decode side yet, so its rank is fixed to 0
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_pp_size = self.prefill_pp_size
@@ -300,6 +299,7 @@ class DecodePreallocQueue:
             return
 
         if is_retracted:
+            req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
@@ -340,7 +340,7 @@ class DecodePreallocQueue:
 
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
-    ) -> Tuple[List[Req], bool]:
+    ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
 
         # allocate memory
@@ -378,13 +378,7 @@ class DecodePreallocQueue:
             if i not in indices_to_remove
         ]
 
-        has_retracted_req = (
-            bool(len(self.retracted_queue) > 0)
-            if rids_to_check is None
-            else any(req.rid in rids_to_check for req in self.retracted_queue)
-        )
-
-        return resumed_reqs, has_retracted_req
+        return resumed_reqs
 
     def _update_handshake_waiters(
         self, rids_to_check: Optional[List[str]] = None
@@ -426,7 +420,7 @@ class DecodePreallocQueue:
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
-    ) -> List[DecodeRequest]:
+    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._update_handshake_waiters(rids_to_check)
 
@@ -968,7 +962,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs, _ = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
