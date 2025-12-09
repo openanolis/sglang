@@ -120,6 +120,11 @@ pub enum WorkerSelection {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     },
+    Triple {
+        encode: Arc<dyn Worker>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    },
 }
 
 /// Client selection (Step 3)
@@ -128,6 +133,11 @@ pub enum ClientSelection {
         client: GrpcClient,
     },
     Dual {
+        prefill: GrpcClient,
+        decode: GrpcClient,
+    },
+    Triple {
+        encode: GrpcClient,
         prefill: GrpcClient,
         decode: GrpcClient,
     },
@@ -314,6 +324,10 @@ impl WorkerSelection {
         matches!(self, Self::Dual { .. })
     }
 
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple { .. })
+    }
+
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
@@ -329,16 +343,35 @@ impl WorkerSelection {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn triple(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>, &Arc<dyn Worker>)> {
+        match self {
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
+            _ => None,
+        }
+    }
+
     pub fn prefill_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Dual { prefill, .. } | Self::Triple { prefill, .. } => Some(prefill),
+            _ => None,
+        }
+    }
+
+    pub fn encode_worker(&self) -> Option<&Arc<dyn Worker>> {
+        match self {
+            Self::Triple { encode, .. } => Some(encode),
             _ => None,
         }
     }
 
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
@@ -347,6 +380,10 @@ impl WorkerSelection {
 impl ClientSelection {
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
+    }
+
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple { .. })
     }
 
     pub fn single(&self) -> Option<&GrpcClient> {
@@ -377,30 +414,52 @@ impl ClientSelection {
         }
     }
 
-    pub fn prefill_client(&self) -> Option<&GrpcClient> {
+    pub fn triple(&self) -> Option<(&GrpcClient, &GrpcClient, &GrpcClient)> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
+    pub fn triple_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient, &mut GrpcClient)> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
             _ => None,
         }
     }
 
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
 
     pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
+            _ => None,
+        }
+    }
+
+    pub fn encode_client(&self) -> Option<&GrpcClient> {
+        match self {
+            Self::Triple { encode, .. } => Some(encode),
+            _ => None,
+        }
+    }
+
+    pub fn encode_client_mut(&mut self) -> Option<&mut GrpcClient> {
+        match self {
+            Self::Triple { encode, .. } => Some(encode),
             _ => None,
         }
     }
@@ -414,6 +473,11 @@ pub enum ExecutionResult {
     },
     Dual {
         prefill: ProtoStream,
+        decode: Box<ProtoStream>,
+    },
+    Triple {
+        encode: Box<ProtoStream>,
+        prefill: Box<ProtoStream>,
         decode: Box<ProtoStream>,
     },
 }
