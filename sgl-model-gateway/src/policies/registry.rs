@@ -34,6 +34,9 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode
     decode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
+
+    /// Encode policy for EPD mode
+    encode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
 }
 
 impl PolicyRegistry {
@@ -47,6 +50,7 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
+            encode_policy: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -255,6 +259,12 @@ impl PolicyRegistry {
         *decode_policy = Some(policy);
     }
 
+    /// Set the encode policy for EPD mode
+    pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        let mut encode_policy = self.encode_policy.write().unwrap();
+        *encode_policy = Some(policy);
+    }
+
     /// Get the prefill policy for PD mode, or default if not set
     pub fn get_prefill_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         let prefill_policy = self.prefill_policy.read().unwrap();
@@ -268,6 +278,15 @@ impl PolicyRegistry {
     pub fn get_decode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         let decode_policy = self.decode_policy.read().unwrap();
         decode_policy
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| self.get_default_policy())
+    }
+
+    /// Get the encode policy for EPD mode, or default if not set
+    pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
+        let encode_policy = self.encode_policy.read().unwrap();
+        encode_policy
             .as_ref()
             .map(Arc::clone)
             .unwrap_or_else(|| self.get_default_policy())
@@ -297,6 +316,18 @@ impl PolicyRegistry {
                 && !prefill_policy_opt
                     .as_ref()
                     .is_some_and(|p| Arc::ptr_eq(p, policy))
+            {
+                power_of_two_policies.push(Arc::clone(policy));
+            }
+        }
+
+        if let Some(ref policy) = *self.encode_policy.read().unwrap() {
+            let already_present = power_of_two_policies
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, policy));
+            if policy.name() == "power_of_two"
+                && !Arc::ptr_eq(policy, &self.default_policy)
+                && !already_present
             {
                 power_of_two_policies.push(Arc::clone(policy));
             }
