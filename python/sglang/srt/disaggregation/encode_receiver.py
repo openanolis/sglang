@@ -321,7 +321,7 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def _run_encode_in_thread(
-        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
+        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port, encode_urls=None
     ):
         try:
             asyncio.run(
@@ -332,6 +332,7 @@ class MMReceiver:
                     endpoint_encode=endpoint_encode,
                     endpoint_send=None,
                     num_items_assigned=num_items_assigned,
+                    encode_urls=encode_urls,
                 )
             )
         except Exception as e:
@@ -345,17 +346,22 @@ class MMReceiver:
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        encode_urls=None,
     ):
+        # Use dynamic encoder URLs if provided, else fallback to static config
+        encode_urls = encode_urls if encode_urls is not None else self.encode_urls
+        encode_idx = list(range(len(encode_urls)))
+
         if len(img_data) == 0:
             return
 
         # Split mm_items
         encode_requests = []
         if num_items_assigned is None:
-            random.shuffle(self.encode_idx)
+            random.shuffle(encode_idx)
             num_items_assigned = [
-                (idx + len(img_data)) // len(self.encode_urls)
-                for idx in self.encode_idx
+                (idx + len(img_data)) // len(encode_urls)
+                for idx in encode_idx
             ]
         num_parts = sum(1 for x in num_items_assigned if x != 0)
         cum_num_items = 0
@@ -386,7 +392,7 @@ class MMReceiver:
 
             tasks = [
                 session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
+                    f"{encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
                     json=encode_request,
                 )
                 for encode_request in encode_requests
@@ -430,7 +436,7 @@ class MMReceiver:
                 )
                 metadata_tasks.append(
                     session.post(
-                        f"{self.encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
+                        f"{encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
                         json=response_json,
                     )
                 )
@@ -451,7 +457,10 @@ class MMReceiver:
         return embeddings.data_ptr()
 
     # For zmq_to_scheduler
-    def send_encode_requset(self, obj):
+    def send_encode_requset(self, obj, encoder_url=None):
+        # Use dynamic encoder URL if provided, else fallback to static config
+        encode_urls = [encoder_url] if encoder_url else self.encode_urls
+
         if type(obj.image_data) != list:
             image_urls = [obj.image_data.url]
         else:
@@ -462,10 +471,10 @@ class MMReceiver:
             logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
             obj.need_wait_for_image = True
 
-            encode_idx = list(range(len(self.encode_urls)))
+            encode_idx = list(range(len(encode_urls)))
             random.shuffle(encode_idx)
             obj.num_items_assigned = [
-                (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
+                (idx + len(image_urls)) // len(encode_urls) for idx in encode_idx
             ]
             obj.embedding_ports = (
                 [get_free_port() for _ in range(self.world_size)]
@@ -480,15 +489,18 @@ class MMReceiver:
                     "encode",
                     obj.num_items_assigned,
                     obj.embedding_ports,
+                    encode_urls,
                 ),
                 daemon=True,
             )
             encode_thread.start()
 
     # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
+    async def recv_mm_data(self, img_data, mm_processor, prompt, encoder_url=None):
         try:
-            if len(self.encode_urls) == 0:
+            # Use dynamic encoder URL from router if provided, else fallback to static config
+            encode_urls = [encoder_url] if encoder_url else self.encode_urls
+            if len(encode_urls) == 0:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port = get_free_port()
@@ -497,7 +509,7 @@ class MMReceiver:
             else:
                 img_data = [img.url for img in img_data]
             asyncio.create_task(
-                self.encode(req_id, img_data, embedding_port, "encode", "send")
+                self.encode(req_id, img_data, embedding_port, "encode", "send", encode_urls=encode_urls)
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, embedding_port, mm_processor, prompt),

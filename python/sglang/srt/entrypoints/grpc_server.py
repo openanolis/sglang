@@ -404,6 +404,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         bootstrap_host = None
         bootstrap_port = None
         bootstrap_room = None
+        encode_bootstrap_host = None
+        encode_bootstrap_port = None
+        encode_bootstrap_room = None
         if grpc_req.HasField("disaggregated_params"):
             # Don't use 'or None' as it treats 0 as falsy
             bootstrap_host = (
@@ -419,6 +422,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_room = (
                 grpc_req.disaggregated_params.bootstrap_room
             )  # Can be 0, don't use 'or None'
+
+            # EPD fields (router provides encoder location per-request)
+            if grpc_req.disaggregated_params.HasField("encode_bootstrap_host"):
+                encode_bootstrap_host = grpc_req.disaggregated_params.encode_bootstrap_host
+            if grpc_req.disaggregated_params.HasField("encode_bootstrap_port"):
+                encode_bootstrap_port = grpc_req.disaggregated_params.encode_bootstrap_port
+            if grpc_req.disaggregated_params.HasField("encode_bootstrap_room"):
+                encode_bootstrap_room = grpc_req.disaggregated_params.encode_bootstrap_room
 
         # Create request
         return TokenizedGenerateReqInput(
@@ -442,6 +453,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            encode_bootstrap_host=encode_bootstrap_host,
+            encode_bootstrap_port=encode_bootstrap_port,
+            encode_bootstrap_room=encode_bootstrap_room,
         )
 
     def _convert_embed_request(

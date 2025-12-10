@@ -425,7 +425,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
             and obj.contains_mm_input()
         ):
-            self.mm_receiver.send_encode_requset(obj)
+            # Use dynamic encoder URL from router if provided
+            encoder_url = None
+            if obj.encode_bootstrap_host and obj.encode_bootstrap_port:
+                encoder_url = f"http://{obj.encode_bootstrap_host}:{obj.encode_bootstrap_port}"
+            self.mm_receiver.send_encode_requset(obj, encoder_url=encoder_url)
 
         if self.enable_trace:
             self._trace_request_start(obj, created_time, request)
@@ -639,10 +643,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 in ["zmq_to_tokenizer", "mooncake"]
             ):
                 if self.server_args.language_only:
+                    # Use dynamic encoder URL from router if provided
+                    encoder_url = None
+                    if hasattr(obj, 'encode_bootstrap_host') and obj.encode_bootstrap_host and obj.encode_bootstrap_port:
+                        encoder_url = f"http://{obj.encode_bootstrap_host}:{obj.encode_bootstrap_port}"
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         img_data=obj.image_data,
                         mm_processor=self.mm_processor,
                         prompt=(input_text or input_ids),
+                        encoder_url=encoder_url,
                     )
                 if mm_inputs is None:
                     mm_inputs: Dict = await self.mm_data_processor.process(

@@ -215,6 +215,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
+    # EPD: Encoder worker bootstrap metadata (for router-directed encoder coordination)
+    encode_bootstrap_host: Optional[Union[List[str], str]] = None
+    encode_bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    encode_bootstrap_room: Optional[Union[List[int], int]] = None
+
     # For reasoning
     reasoning: bool = False
 
@@ -703,6 +708,11 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+
+    # EPD: Encoder worker bootstrap metadata (for router-directed encoder coordination)
+    encode_bootstrap_host: Optional[str] = None
+    encode_bootstrap_port: Optional[int] = None
+    encode_bootstrap_room: Optional[int] = None
 
     # For reasoning
     reasoning: bool = False
