@@ -83,6 +83,7 @@ dependencies = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+vad = ["silero-vad"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",

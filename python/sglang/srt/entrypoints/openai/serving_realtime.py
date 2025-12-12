@@ -49,6 +49,17 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.utils.audio_utils import AudioBuffer
 
+# Try to import VAD utilities, but make it optional
+try:
+    from sglang.srt.utils.vad_utils import VADManager, SILERO_VAD_AVAILABLE
+
+    _VAD_AVAILABLE = SILERO_VAD_AVAILABLE
+except ImportError:
+    VADManager = None  # type: ignore
+    _VAD_AVAILABLE = False
+
+SILERO_VAD_AVAILABLE = _VAD_AVAILABLE
+
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -99,6 +110,11 @@ class RealtimeSession:
         self.is_generating = False
         self.created_at = time.time()
 
+        # VAD-related state
+        self.vad_manager: Optional[Any] = None
+        self.last_speech_time: Optional[float] = None
+        self.silence_start_time: Optional[float] = None
+
     def update_configuration(
         self, configuration: RealtimeSessionConfiguration
     ):
@@ -112,6 +128,61 @@ class RealtimeSession:
         self.configuration = self.configuration.model_copy(
             update=configuration.model_dump(exclude_unset=True)
         )
+        # Setup VAD if turn_detection is configured
+        self.setup_vad()
+
+    def setup_vad(self):
+        """Setup VAD manager based on turn_detection configuration."""
+        # Clear existing VAD if turn_detection is disabled
+        if not self.configuration.turn_detection:
+            self.vad_manager = None
+            self.last_speech_time = None
+            self.silence_start_time = None
+            return
+
+        # Check if VAD is enabled
+        turn_detection = self.configuration.turn_detection
+        if not isinstance(turn_detection, dict):
+            return
+
+        vad_type = turn_detection.get("type", "")
+        if vad_type != "server_vad":
+            # VAD not enabled or different type
+            self.vad_manager = None
+            self.last_speech_time = None
+            self.silence_start_time = None
+            return
+
+        # Check if silero-vad is available
+        if not SILERO_VAD_AVAILABLE or VADManager is None:
+            logger.warning(
+                "VAD requested but silero-vad is not available. "
+                "Install it with: pip install silero-vad"
+            )
+            return
+
+        # Get VAD parameters from configuration
+        threshold = turn_detection.get("threshold", 0.5)
+        sample_rate = self.audio_buffer.sample_rate
+
+        # Initialize VAD manager
+        try:
+            self.vad_manager = VADManager(
+                sample_rate=sample_rate,
+                threshold=threshold,
+                min_speech_duration_ms=250,
+                min_silence_duration_ms=100,
+            )
+            logger.debug(
+                f"VAD manager initialized for session {self.session_id} "
+                f"with threshold={threshold}, sample_rate={sample_rate}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to initialize VAD manager for session {self.session_id}: {e}",
+                exc_info=True,
+            )
+            self.vad_manager = None
 
     def append_audio(self, audio_data: str, format: Optional[str] = None):
         """Append audio data to buffer."""
@@ -498,10 +569,105 @@ class OpenAIServingRealtime(OpenAIServingBase):
             audio_data = event_data.get("audio", "")
             format = session.configuration.input_audio_format
             session.append_audio(audio_data, format)
+
+            # Perform VAD detection if enabled
+            if session.vad_manager is not None:
+                await self._process_vad_detection(session, websocket, format)
         except Exception as e:
             await self._send_error(
                 websocket, f"Failed to append audio: {e}", "invalid_request_error"
             )
+
+    async def _process_vad_detection(
+        self,
+        session: RealtimeSession,
+        websocket: WebSocket,
+        format: Optional[str] = None,
+    ):
+        """Process VAD detection on accumulated audio.
+
+        Args:
+            session: RealtimeSession instance
+            websocket: WebSocket connection
+            format: Audio format for decoding
+        """
+        if session.vad_manager is None:
+            return
+
+        # Get the latest audio chunk for VAD detection
+        # Decode the most recent chunk(s) for real-time detection
+        audio_result = session.audio_buffer.get_audio(format=format)
+        if audio_result is None:
+            return
+
+        audio_array, sample_rate = audio_result
+
+        # Get VAD configuration
+        turn_detection = session.configuration.turn_detection
+        if not isinstance(turn_detection, dict):
+            return
+
+        silence_duration_ms = turn_detection.get("silence_duration_ms", 500.0)
+        idle_timeout_ms = turn_detection.get("idle_timeout_ms")
+
+        # Check for idle timeout
+        if idle_timeout_ms is not None:
+            current_time = time.time()
+            if session.last_speech_time is None:
+                # No speech detected yet, check if we've been idle too long
+                if session.silence_start_time is None:
+                    session.silence_start_time = current_time
+                else:
+                    idle_duration = (
+                        current_time - session.silence_start_time
+                    ) * 1000.0
+                    if idle_duration >= idle_timeout_ms:
+                        # Idle timeout reached, commit anyway
+                        logger.debug(
+                            f"Idle timeout reached ({idle_timeout_ms}ms) "
+                            f"for session {session.session_id}"
+                        )
+                        await self._handle_audio_commit(session, {}, websocket)
+                        return
+
+        # Use a sliding window approach: check the last portion of audio
+        # For real-time detection, check the most recent audio
+        # Use a reasonable window size (e.g., last 1 second of audio)
+        window_size_samples = min(int(sample_rate * 1.0), len(audio_array))
+        recent_audio = audio_array[-window_size_samples:]
+
+        # Perform VAD detection
+        try:
+            should_commit, updated_last_speech_time = (
+                session.vad_manager.check_silence_duration(
+                    recent_audio,
+                    silence_duration_ms,
+                    session.last_speech_time,
+                )
+            )
+
+            # Update last speech time
+            if updated_last_speech_time is not None:
+                session.last_speech_time = updated_last_speech_time
+                session.silence_start_time = None
+            elif session.last_speech_time is not None:
+                # Still in silence, update silence start time if needed
+                if session.silence_start_time is None:
+                    session.silence_start_time = time.time()
+
+            # Auto-commit if silence duration exceeded
+            if should_commit:
+                logger.debug(
+                    f"VAD detected silence duration >= {silence_duration_ms}ms, "
+                    f"auto-committing audio for session {session.session_id}"
+                )
+                await self._handle_audio_commit(session, {}, websocket)
+        except Exception as e:
+            logger.error(
+                f"Error in VAD detection for session {session.session_id}: {e}",
+                exc_info=True,
+            )
+            # Don't fail the request, just log the error
 
     async def _handle_audio_clear(
         self,
@@ -511,6 +677,9 @@ class OpenAIServingRealtime(OpenAIServingBase):
     ):
         """Handle input_audio_buffer.clear event."""
         session.clear_audio_buffer()
+        # Reset VAD state when buffer is cleared
+        session.last_speech_time = None
+        session.silence_start_time = None
 
     async def _handle_audio_commit(
         self,
@@ -540,6 +709,9 @@ class OpenAIServingRealtime(OpenAIServingBase):
         # Clear accumulated audio buffer after getting the audio
         # This ensures we only process the audio that was committed
         session.clear_audio_buffer()
+        # Reset VAD state after commit
+        session.last_speech_time = None
+        session.silence_start_time = None
         logger.debug(
             f"Cleared audio buffer after commit "
             f"for session {session.session_id}"
