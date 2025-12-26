@@ -7,17 +7,17 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::interval;
 use tracing::{debug, info};
 
-use super::sync::HASyncManager;
+use super::sync::MeshSyncManager;
 
 /// Rate limit window manager
 /// Handles periodic reset of rate limit counters for time window management
 pub struct RateLimitWindow {
-    sync_manager: Arc<HASyncManager>,
+    sync_manager: Arc<MeshSyncManager>,
     window_seconds: u64,
 }
 
 impl RateLimitWindow {
-    pub fn new(sync_manager: Arc<HASyncManager>, window_seconds: u64) -> Self {
+    pub fn new(sync_manager: Arc<MeshSyncManager>, window_seconds: u64) -> Self {
         Self {
             sync_manager,
             window_seconds,

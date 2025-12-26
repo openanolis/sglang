@@ -78,7 +78,7 @@ use super::{
 };
 use crate::{
     core::Worker,
-    ha::{tree_ops::TreeOperation, OptionalHASyncManager},
+    mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager},
 };
 
 /// Cache-aware routing policy
@@ -86,7 +86,7 @@ use crate::{
 /// Routes requests based on cache affinity when load is balanced,
 /// switches to shortest-queue routing when load is imbalanced.
 /// Maintains separate trees per model for multi-model support.
-/// Supports HA synchronization of tree operations across cluster nodes.
+/// Supports mesh synchronization of tree operations across cluster nodes.
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
@@ -95,7 +95,7 @@ pub struct CacheAwarePolicy {
     eviction_handle: Option<thread::JoinHandle<()>>,
     /// Flag to signal the eviction thread to stop
     shutdown_flag: Arc<AtomicBool>,
-    ha_sync: OptionalHASyncManager,
+    mesh_sync: OptionalMeshSyncManager,
 }
 
 impl CacheAwarePolicy {
@@ -104,12 +104,12 @@ impl CacheAwarePolicy {
     }
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
-        Self::with_config_and_ha_sync(config, None)
+        Self::with_config_and_mesh_sync(config, None)
     }
 
-    pub fn with_config_and_ha_sync(
+    pub fn with_config_and_mesh_sync(
         config: CacheAwareConfig,
-        ha_sync: OptionalHASyncManager,
+        mesh_sync: OptionalMeshSyncManager,
     ) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -166,21 +166,21 @@ impl CacheAwarePolicy {
             trees,
             eviction_handle,
             shutdown_flag,
-            ha_sync: ha_sync.clone(),
+            mesh_sync: mesh_sync.clone(),
         };
 
-        // Restore tree state from HA if available
-        if ha_sync.is_some() {
+        // Restore tree state from mesh if available
+        if mesh_sync.is_some() {
             policy.restore_tree_state_from_ha();
         }
 
         policy
     }
 
-    /// Set HA sync manager (can be called after construction)
-    pub fn set_ha_sync(&mut self, ha_sync: OptionalHASyncManager) {
-        self.ha_sync = ha_sync.clone();
-        if ha_sync.is_some() {
+    /// Set mesh sync manager (can be called after construction)
+    pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
+        self.mesh_sync = mesh_sync.clone();
+        if mesh_sync.is_some() {
             self.restore_tree_state_from_ha();
         }
     }
@@ -244,31 +244,31 @@ impl CacheAwarePolicy {
             let model_id = tree_ref.key().clone();
             tree_ref.value().remove_tenant(url);
 
-            // Sync removal to HA
-            if let Some(ref ha_sync) = self.ha_sync {
-                use crate::ha::tree_ops::TreeRemoveOp;
+            // Sync removal to mesh
+            if let Some(ref mesh_sync) = self.mesh_sync {
+                use crate::mesh::tree_ops::TreeRemoveOp;
                 let op = TreeOperation::Remove(TreeRemoveOp {
                     tenant: url.to_string(),
                 });
-                if let Err(e) = ha_sync.sync_tree_operation(model_id, op) {
-                    warn!("Failed to sync tree remove operation to HA: {}", e);
+                if let Err(e) = mesh_sync.sync_tree_operation(model_id, op) {
+                    warn!("Failed to sync tree remove operation to mesh: {}", e);
                 }
             }
         }
     }
 
-    /// Restore tree state from HA store
+    /// Restore tree state from mesh store
     /// This is called during initialization to rebuild trees from synchronized state
     fn restore_tree_state_from_ha(&self) {
-        if let Some(ref ha_sync) = self.ha_sync {
-            // Get all tree states from HA
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            // Get all tree states from mesh
             // We need to iterate through all models that have tree states
             // For now, we'll restore trees for models that are already in our trees map
-            // In a full implementation, we might want to query HA for all tree states
+            // In a full implementation, we might want to query mesh for all tree states
 
             for tree_ref in self.trees.iter() {
                 let model_id = tree_ref.key();
-                if let Some(tree_state) = ha_sync.get_tree_state(model_id) {
+                if let Some(tree_state) = mesh_sync.get_tree_state(model_id) {
                     debug!(
                         "Restoring tree state for model {} with {} operations",
                         model_id,
@@ -292,7 +292,7 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Apply remote tree operation from HA
+    /// Apply remote tree operation from mesh
     /// This is called when receiving tree state updates from other nodes
     pub fn apply_remote_tree_operation(&self, model_id: &str, operation: &TreeOperation) {
         let tree_key = if model_id.is_empty() || model_id == "unknown" {
@@ -377,15 +377,15 @@ impl CacheAwarePolicy {
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
-                // Sync insert operation to HA
-                if let Some(ref ha_sync) = self.ha_sync {
-                    use crate::ha::tree_ops::TreeInsertOp;
+                // Sync insert operation to mesh
+                if let Some(ref mesh_sync) = self.mesh_sync {
+                    use crate::mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
                         text: text.to_string(),
                         tenant: worker_url.to_string(),
                     });
-                    if let Err(e) = ha_sync.sync_tree_operation(model_id.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to HA: {}", e);
+                    if let Err(e) = mesh_sync.sync_tree_operation(model_id.to_string(), op) {
+                        warn!("Failed to sync tree insert operation to mesh: {}", e);
                     }
                 }
             } else {
@@ -470,15 +470,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     // Update the tree with this request
                     tree.insert(text, &selected_url);
 
-                    // Sync insert operation to HA
-                    if let Some(ref ha_sync) = self.ha_sync {
-                        use crate::ha::tree_ops::TreeInsertOp;
+                    // Sync insert operation to mesh
+                    if let Some(ref mesh_sync) = self.mesh_sync {
+                        use crate::mesh::tree_ops::TreeInsertOp;
                         let op = TreeOperation::Insert(TreeInsertOp {
                             text: text.to_string(),
                             tenant: selected_url.clone(),
                         });
-                        if let Err(e) = ha_sync.sync_tree_operation(model_id.to_string(), op) {
-                            warn!("Failed to sync tree insert operation to HA: {}", e);
+                        if let Err(e) = mesh_sync.sync_tree_operation(model_id.to_string(), op) {
+                            warn!("Failed to sync tree insert operation to mesh: {}", e);
                         }
                     }
 
@@ -492,14 +492,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 tree.remove_tenant(&selected_url);
                 debug!("Removed stale worker {} from cache tree", selected_url);
 
-                // Sync removal to HA
-                if let Some(ref ha_sync) = self.ha_sync {
-                    use crate::ha::tree_ops::TreeRemoveOp;
+                // Sync removal to mesh
+                if let Some(ref mesh_sync) = self.mesh_sync {
+                    use crate::mesh::tree_ops::TreeRemoveOp;
                     let op = TreeOperation::Remove(TreeRemoveOp {
                         tenant: selected_url.clone(),
                     });
-                    if let Err(e) = ha_sync.sync_tree_operation(model_id.to_string(), op) {
-                        warn!("Failed to sync tree remove operation to HA: {}", e);
+                    if let Err(e) = mesh_sync.sync_tree_operation(model_id.to_string(), op) {
+                        warn!("Failed to sync tree remove operation to mesh: {}", e);
                     }
                 }
             }

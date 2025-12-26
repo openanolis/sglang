@@ -128,9 +128,9 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     # HA configuration
     enable_ha: bool = False
-    ha_server_name: Optional[str] = None
-    ha_host: str = "0.0.0.0"
-    ha_port: int = 39527
+    mesh_server_name: Optional[str] = None
+    mesh_host: str = "0.0.0.0"
+    mesh_port: int = 39527
     peer_urls: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
@@ -698,19 +698,19 @@ class RouterArgs:
             help="Enable HA (High Availability) mode",
         )
         parser.add_argument(
-            f"--{prefix}ha-server-name",
+            f"--{prefix}mesh-server-name",
             type=str,
             default=None,
             help="Name of the HA server",
         )
         parser.add_argument(
-            f"--{prefix}ha-host",
+            f"--{prefix}mesh-host",
             type=str,
             default="0.0.0.0",
             help="Host address of the HA server",
         )
         parser.add_argument(
-            f"--{prefix}ha-port",
+            f"--{prefix}mesh-port",
             type=int,
             default=39527,
             help="Port of the HA server",

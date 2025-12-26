@@ -14,7 +14,7 @@ use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
     ManualPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
-use crate::{config::types::PolicyConfig, core::Worker, ha::OptionalHASyncManager};
+use crate::{config::types::PolicyConfig, core::Worker, mesh::sync::OptionalMeshSyncManager};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -34,8 +34,8 @@ pub struct PolicyRegistry {
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
-    /// Optional HA sync manager for state synchronization
-    ha_sync: OptionalHASyncManager,
+    /// Optional mesh sync manager for state synchronization
+    mesh_sync: OptionalMeshSyncManager,
 }
 
 impl PolicyRegistry {
@@ -47,17 +47,17 @@ impl PolicyRegistry {
             default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
-            ha_sync: None,
+            mesh_sync: None,
         };
         let default_policy = registry.create_policy_from_config(&default_policy_config);
         registry.default_policy = default_policy;
         registry
     }
 
-    /// Create a new PolicyRegistry with HA sync manager
-    pub fn with_ha_sync(
+    /// Create a new PolicyRegistry with mesh sync manager
+    pub fn with_mesh_sync(
         default_policy_config: PolicyConfig,
-        ha_sync: OptionalHASyncManager,
+        mesh_sync: OptionalMeshSyncManager,
     ) -> Self {
         let mut registry = Self {
             model_policies: Arc::new(DashMap::new()),
@@ -65,16 +65,16 @@ impl PolicyRegistry {
             default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
-            ha_sync: ha_sync.clone(),
+            mesh_sync: mesh_sync.clone(),
         };
         let default_policy = registry.create_policy_from_config(&default_policy_config);
         registry.default_policy = default_policy;
         registry
     }
 
-    /// Set HA sync manager
-    pub fn set_ha_sync(&mut self, ha_sync: OptionalHASyncManager) {
-        self.ha_sync = ha_sync;
+    /// Set mesh sync manager
+    pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
+        self.mesh_sync = mesh_sync;
     }
 
     /// Called when a worker is added
@@ -116,11 +116,11 @@ impl PolicyRegistry {
         self.model_policies
             .insert(model_id.to_string(), Arc::clone(&policy));
 
-        // Sync to HA if enabled
-        if let Some(ref ha_sync) = self.ha_sync {
+        // Sync to mesh if enabled
+        if let Some(ref mesh_sync) = self.mesh_sync {
             // Serialize policy config (simplified - just store policy name for now)
             let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
-            ha_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
+            mesh_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
         }
 
         policy
@@ -161,9 +161,9 @@ impl PolicyRegistry {
                 );
             }
 
-            // Sync removal to HA if enabled
-            if let Some(ref ha_sync) = self.ha_sync {
-                ha_sync.remove_policy_state(model_id);
+            // Sync removal to mesh if enabled
+            if let Some(ref mesh_sync) = self.mesh_sync {
+                mesh_sync.remove_policy_state(model_id);
             }
         }
     }
@@ -207,11 +207,11 @@ impl PolicyRegistry {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => {
-                // Create CacheAwarePolicy with HA sync if available
-                if let Some(ref ha_sync) = self.ha_sync {
-                    Arc::new(CacheAwarePolicy::with_config_and_ha_sync(
+                // Create CacheAwarePolicy with mesh sync if available
+                if let Some(ref mesh_sync) = self.mesh_sync {
+                    Arc::new(CacheAwarePolicy::with_config_and_mesh_sync(
                         CacheAwareConfig::default(),
-                        Some(ha_sync.clone()),
+                        Some(mesh_sync.clone()),
                     ))
                 } else {
                     Arc::new(CacheAwarePolicy::new())
@@ -245,11 +245,11 @@ impl PolicyRegistry {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
                 };
-                // Create CacheAwarePolicy with HA sync if available
-                if let Some(ref ha_sync) = self.ha_sync {
-                    Arc::new(CacheAwarePolicy::with_config_and_ha_sync(
+                // Create CacheAwarePolicy with mesh sync if available
+                if let Some(ref mesh_sync) = self.mesh_sync {
+                    Arc::new(CacheAwarePolicy::with_config_and_mesh_sync(
                         cache_config,
-                        Some(ha_sync.clone()),
+                        Some(mesh_sync.clone()),
                     ))
                 } else {
                     Arc::new(CacheAwarePolicy::with_config(cache_config))
@@ -458,11 +458,11 @@ impl PolicyRegistry {
     }
 
     /// Apply remote tree operation to cache-aware policy for a model
-    /// This is called when receiving tree state updates from HA
+    /// This is called when receiving tree state updates from mesh
     pub fn apply_remote_tree_operation(
         &self,
         model_id: &str,
-        operation: &crate::ha::tree_ops::TreeOperation,
+        operation: &crate::mesh::tree_ops::TreeOperation,
     ) {
         // Try to find the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
