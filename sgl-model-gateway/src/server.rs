@@ -720,48 +720,49 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         metrics::start_prometheus(prometheus_config.clone());
     }
 
-    let (mesh_handler, mesh_sync_manager) = if let Some(mesh_server_config) = &config.mesh_server_config {
-        // Create mesh sync manager with stores first
-        use crate::mesh::{stores::StateStores, sync::MeshSyncManager};
-        let stores = Arc::new(StateStores::with_self_name(
-            mesh_server_config.self_name.clone(),
-        ));
-        let sync_manager = Arc::new(MeshSyncManager::new(
-            stores.clone(),
-            mesh_server_config.self_name.clone(),
-        ));
+    let (mesh_handler, mesh_sync_manager) =
+        if let Some(mesh_server_config) = &config.mesh_server_config {
+            // Create mesh sync manager with stores first
+            use crate::mesh::{stores::StateStores, sync::MeshSyncManager};
+            let stores = Arc::new(StateStores::with_self_name(
+                mesh_server_config.self_name.clone(),
+            ));
+            let sync_manager = Arc::new(MeshSyncManager::new(
+                stores.clone(),
+                mesh_server_config.self_name.clone(),
+            ));
 
-        // Partition detector is created in MeshServerHandler::with_partition_and_state_machine
+            // Partition detector is created in MeshServerHandler::with_partition_and_state_machine
 
-        // Initialize rate-limit hash ring with current membership
-        sync_manager.update_rate_limit_membership();
+            // Initialize rate-limit hash ring with current membership
+            sync_manager.update_rate_limit_membership();
 
-        // Start rate limit window reset task
-        let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
-        spawn(async move {
-            window_manager.start_reset_task().await;
-        });
+            // Start rate limit window reset task
+            let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
+            spawn(async move {
+                window_manager.start_reset_task().await;
+            });
 
-        // Create mesh server builder and build with stores
-        use crate::mesh::service::MeshServerBuilder;
-        let builder = MeshServerBuilder::new(
-            mesh_server_config.self_name.clone(),
-            mesh_server_config.self_addr,
-            mesh_server_config.init_peer,
-        );
-        let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
+            // Create mesh server builder and build with stores
+            use crate::mesh::service::MeshServerBuilder;
+            let builder = MeshServerBuilder::new(
+                mesh_server_config.self_name.clone(),
+                mesh_server_config.self_addr,
+                mesh_server_config.init_peer,
+            );
+            let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
 
-        // Spawn the mesh server
-        spawn(async move {
-            if let Err(e) = mesh_server.start_serve().await {
-                tracing::error!("mesh server failed: {}", e);
-            }
-        });
+            // Spawn the mesh server
+            spawn(async move {
+                if let Err(e) = mesh_server.start_serve().await {
+                    tracing::error!("mesh server failed: {}", e);
+                }
+            });
 
-        (Some(Arc::new(handler)), Some(sync_manager))
-    } else {
-        (None, None)
-    };
+            (Some(Arc::new(handler)), Some(sync_manager))
+        } else {
+            (None, None)
+        };
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
@@ -931,7 +932,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Get mesh cluster state and port before moving mesh_handler into app_state
     let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
-    let mesh_port = config.mesh_server_config.as_ref().map(|c| c.self_addr.port());
+    let mesh_port = config
+        .mesh_server_config
+        .as_ref()
+        .map(|c| c.self_addr.port());
 
     let app_state = Arc::new(AppState {
         router,

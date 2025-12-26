@@ -752,10 +752,13 @@ mod tests {
 
         // Select worker with a request - should sync to mesh
         let _idx = policy
-            .select_worker(&workers, &SelectWorkerInfo {
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
                     request_text: Some("test request"),
                     ..Default::default()
-                })
+                },
+            )
             .unwrap();
 
         // Verify tree operation was synced to mesh
@@ -918,10 +921,13 @@ mod tests {
 
         // Should work without mesh
         let idx = policy
-            .select_worker(&workers, &SelectWorkerInfo {
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
                     request_text: Some("test request"),
                     ..Default::default()
-                })
+                },
+            )
             .unwrap();
         assert_eq!(idx, 0);
     }

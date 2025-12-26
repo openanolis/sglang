@@ -288,7 +288,8 @@ pub async fn start_service_discovery(
         // Router discovery requires mesh to be enabled to update cluster state
         // If mesh is not enabled, router discovery is skipped and service discovery works independently
         if !config_arc.router_selector.is_empty() {
-            if let (Some(cluster_state), Some(mesh_port)) = (mesh_cluster_state.clone(), mesh_port) {
+            if let (Some(cluster_state), Some(mesh_port)) = (mesh_cluster_state.clone(), mesh_port)
+            {
                 let router_config = config_arc.clone();
                 let router_pods = pods.clone();
                 tokio::spawn(async move {

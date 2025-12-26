@@ -9,11 +9,11 @@ use sgl_model_gateway::{
         RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
+    mesh::service::MeshServerConfig,
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
-    mesh::service::MeshServerConfig,
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
     version,

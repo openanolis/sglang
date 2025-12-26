@@ -430,7 +430,8 @@ macro_rules! mesh_run {
     ($name:expr, $addr:expr, $init_peer:expr) => {{
         tracing::info!("Starting mesh server : {}", $addr);
         let (server, handler) =
-            $crate::mesh::service::MeshServerBuilder::new($name.to_string(), $addr, $init_peer).build();
+            $crate::mesh::service::MeshServerBuilder::new($name.to_string(), $addr, $init_peer)
+                .build();
         tokio::spawn(async move {
             if let Err(e) = server.start_serve().await {
                 tracing::error!("mesh server failed: {}", e);
