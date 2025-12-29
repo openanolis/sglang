@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     core::{attach_guards_to_response, Worker, WorkerLoadGuard},
+    grpc_client::SglangEncoderClient,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -131,6 +132,11 @@ pub enum WorkerSelection {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     },
+    Triple {
+        encode: Arc<dyn Worker>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    },
 }
 
 /// Client selection (Step 3)
@@ -139,6 +145,13 @@ pub enum ClientSelection {
         client: GrpcClient,
     },
     Dual {
+        prefill: GrpcClient,
+        decode: GrpcClient,
+    },
+    /// EPD mode: encode, prefill, and decode all use gRPC
+    Triple {
+        /// gRPC client for encode worker
+        encode: SglangEncoderClient,
         prefill: GrpcClient,
         decode: GrpcClient,
     },
@@ -162,6 +175,11 @@ pub enum LoadGuards {
         prefill: WorkerLoadGuard,
         decode: WorkerLoadGuard,
     },
+    Triple {
+        encode: WorkerLoadGuard,
+        prefill: WorkerLoadGuard,
+        decode: WorkerLoadGuard,
+    },
 }
 
 impl From<&WorkerSelection> for LoadGuards {
@@ -171,6 +189,15 @@ impl From<&WorkerSelection> for LoadGuards {
                 LoadGuards::Single(WorkerLoadGuard::new(worker.clone()))
             }
             WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
+                prefill: WorkerLoadGuard::new(prefill.clone()),
+                decode: WorkerLoadGuard::new(decode.clone()),
+            },
+            WorkerSelection::Triple {
+                encode,
+                prefill,
+                decode,
+            } => LoadGuards::Triple {
+                encode: WorkerLoadGuard::new(encode.clone()),
                 prefill: WorkerLoadGuard::new(prefill.clone()),
                 decode: WorkerLoadGuard::new(decode.clone()),
             },
@@ -192,6 +219,11 @@ impl LoadGuards {
         let guards = match self {
             LoadGuards::Single(guard) => vec![guard],
             LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
+            LoadGuards::Triple {
+                encode,
+                prefill,
+                decode,
+            } => vec![encode, prefill, decode],
         };
 
         attach_guards_to_response(guards, response)
@@ -450,6 +482,10 @@ impl WorkerSelection {
         matches!(self, Self::Dual { .. })
     }
 
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple { .. })
+    }
+
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
@@ -465,12 +501,40 @@ impl WorkerSelection {
                 prefill.record_outcome(success);
                 decode.record_outcome(success);
             }
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => {
+                encode.record_outcome(success);
+                prefill.record_outcome(success);
+                decode.record_outcome(success);
+            }
         }
     }
 
     /// Record circuit breaker outcomes for dual dispatch (individual tracking)
     pub fn record_dual_outcomes(&self, prefill_success: bool, decode_success: bool) {
         if let Self::Dual { prefill, decode } = self {
+            prefill.record_outcome(prefill_success);
+            decode.record_outcome(decode_success);
+        }
+    }
+
+    /// Record circuit breaker outcomes for triple dispatch (individual tracking)
+    pub fn record_triple_outcomes(
+        &self,
+        encode_success: bool,
+        prefill_success: bool,
+        decode_success: bool,
+    ) {
+        if let Self::Triple {
+            encode,
+            prefill,
+            decode,
+        } = self
+        {
+            encode.record_outcome(encode_success);
             prefill.record_outcome(prefill_success);
             decode.record_outcome(decode_success);
         }
@@ -484,16 +548,35 @@ impl WorkerSelection {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn triple(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>, &Arc<dyn Worker>)> {
+        match self {
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
+            _ => None,
+        }
+    }
+
     pub fn prefill_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Dual { prefill, .. } | Self::Triple { prefill, .. } => Some(prefill),
+            _ => None,
+        }
+    }
+
+    pub fn encode_worker(&self) -> Option<&Arc<dyn Worker>> {
+        match self {
+            Self::Triple { encode, .. } => Some(encode),
             _ => None,
         }
     }
 
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
@@ -502,6 +585,10 @@ impl WorkerSelection {
 impl ClientSelection {
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
+    }
+
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple { .. })
     }
 
     pub fn single(&self) -> Option<&GrpcClient> {
@@ -532,30 +619,38 @@ impl ClientSelection {
         }
     }
 
-    pub fn prefill_client(&self) -> Option<&GrpcClient> {
+    pub fn triple(&self) -> Option<(&SglangEncoderClient, &GrpcClient, &GrpcClient)> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
+    pub fn triple_mut(&mut self) -> Option<(&SglangEncoderClient, &mut GrpcClient, &mut GrpcClient)> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => Some((encode, prefill, decode)),
             _ => None,
         }
     }
 
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
 
     pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Dual { decode, .. } | Self::Triple { decode, .. } => Some(decode),
             _ => None,
         }
     }
@@ -563,6 +658,9 @@ impl ClientSelection {
 
 /// Result of request execution (streams from workers)
 /// Uses ProtoStream to automatically abort on cancellation
+///
+/// Note: EPD mode uses Dual (prefill + decode) since encode happens
+/// synchronously via gRPC before the prefill/decode streams are created.
 pub enum ExecutionResult {
     Single {
         stream: ProtoStream,
