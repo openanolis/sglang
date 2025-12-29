@@ -5,11 +5,14 @@ use axum::response::Response;
 use tracing::error;
 
 use super::PipelineStage;
-use crate::routers::{
-    error,
-    grpc::{
-        context::{ClientSelection, RequestContext, WorkerSelection},
-        utils,
+use crate::{
+    grpc_client::SglangEncoderClient,
+    routers::{
+        error,
+        grpc::{
+            context::{ClientSelection, RequestContext, WorkerSelection},
+            utils,
+        },
     },
 };
 
@@ -53,6 +56,58 @@ impl PipelineStage for ClientAcquisitionStage {
                 }
 
                 ClientSelection::Dual {
+                    prefill: prefill_client,
+                    decode: decode_client,
+                }
+            }
+            WorkerSelection::Triple {
+                encode,
+                prefill,
+                decode,
+            } => {
+                // EPD mode: encode, prefill, and decode all use gRPC
+                // Create gRPC encoder client for encode worker
+                let encode_url = encode.url();
+                let encode_client = SglangEncoderClient::connect(encode_url)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            function = "ClientAcquisitionStage::execute",
+                            encode_url = %encode_url,
+                            error = %e,
+                            "Failed to connect gRPC encoder client"
+                        );
+                        error::internal_error(
+                            "encode_client_connect_failed",
+                            format!("Failed to connect to encode worker at {}: {}", encode_url, e),
+                        )
+                    })?;
+
+                let prefill_client = utils::get_grpc_client_from_worker(prefill).await?;
+                let decode_client = utils::get_grpc_client_from_worker(decode).await?;
+
+                // vLLM does not support EPD disaggregated mode
+                if prefill_client.is_vllm() || decode_client.is_vllm() {
+                    error!(
+                        function = "ClientAcquisitionStage::execute",
+                        "vLLM backend does not support encode/prefill/decode disaggregated mode"
+                    );
+                    return Err(error::bad_request(
+                        "vllm_epd_mode_not_supported",
+                        "vLLM backend does not support encode/prefill/decode disaggregated mode. \
+                         Please use runtime_type: sglang for EPD mode, or use a regular worker configuration."
+                    ));
+                }
+
+                tracing::debug!(
+                    encode_url = %encode_url,
+                    prefill_url = %prefill.url(),
+                    decode_url = %decode.url(),
+                    "EPD mode: all workers use gRPC"
+                );
+
+                ClientSelection::Triple {
+                    encode: encode_client,
                     prefill: prefill_client,
                     decode: decode_client,
                 }
