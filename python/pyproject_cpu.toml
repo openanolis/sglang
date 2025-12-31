@@ -74,6 +74,7 @@ tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
+  "cachetools",
 ]
 test = [
   "accelerate",
