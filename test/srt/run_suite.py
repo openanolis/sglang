@@ -41,12 +41,7 @@ suites = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 6),
         TestFile("openai_server/validation/test_request_length_validation.py", 38),
         TestFile("ops/test_repeat_interleave.py", 60),
-        TestFile("quant/test_block_int8.py", 44),
-        TestFile("quant/test_fp8_kernel.py", 10),
-        TestFile("quant/test_int8_kernel.py", 8),
-        TestFile("quant/test_triton_scaled_mm.py", 8),
-        TestFile("quant/test_w8a8_quantization.py", 160),
-        TestFile("quant/test_autoround.py", 77),
+        # quant tests moved to test/registered/quant/
         TestFile("rl/test_fp32_lm_head.py", 9),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 195),
@@ -59,7 +54,6 @@ suites = {
         TestFile("test_external_models.py", 30),
         TestFile("test_fp8_utils.py", 9),
         TestFile("rotary_embedding/test_mrope.py", 10),
-        TestFile("test_fused_moe.py", 80),
         TestFile("test_gpt_oss_1gpu.py", 402),
         TestFile("test_harmony_parser.py", 6),
         TestFile("test_hidden_states.py", 55),
@@ -93,10 +87,7 @@ suites = {
         TestFile("test_profile_merger_http_api.py", 9),
         TestFile("test_swa_unittest.py", 8),
         TestFile("test_torch_compile.py", 190),
-        TestFile("test_torch_compile_moe.py", 210),
-        TestFile("test_triton_fused_moe.py", 12),
         TestFile("test_torchao.py", 103),
-        TestFile("test_triton_moe_channel_fp8_kernel.py", 16),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_vision_chunked_prefill.py", 150),
@@ -105,12 +96,10 @@ suites = {
         TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-2-gpu": [
-        TestFile("ep/test_moe_ep.py", 140),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
-        TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
@@ -154,7 +143,6 @@ suites = {
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
     # ],
     "per-commit-4-gpu-gb200": [
-        TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
     ],
     "per-commit-4-gpu-deepep": [
@@ -228,10 +216,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("ops/test_repeat_interleave.py", 75),
-        TestFile("quant/test_awq_dequant.py", 2),
-        TestFile("quant/test_block_int8.py", 22),
-        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
-        TestFile("quant/test_triton_scaled_mm.py", 12),
+        # quant tests moved to test/registered/quant/
         TestFile("rl/test_fp32_lm_head.py", 15),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rotary_embedding/test_mrope.py", 15),
@@ -241,7 +226,6 @@ suite_amd = {
         TestFile("test_constrained_decoding.py", 120),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_external_models.py", 45),
-        TestFile("test_fused_moe.py", 30),
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
