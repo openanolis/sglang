@@ -69,6 +69,21 @@ class SglangSchedulerStub(object):
                 request_serializer=sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
                 response_deserializer=sglang__scheduler__pb2.GetServerInfoResponse.FromString,
                 _registered_method=True)
+        self.Encode = channel.unary_unary(
+                '/sglang.grpc.scheduler.SglangScheduler/Encode',
+                request_serializer=sglang__scheduler__pb2.EncodeRequest.SerializeToString,
+                response_deserializer=sglang__scheduler__pb2.EncodeResponse.FromString,
+                _registered_method=True)
+        self.EncodeSend = channel.unary_unary(
+                '/sglang.grpc.scheduler.SglangScheduler/EncodeSend',
+                request_serializer=sglang__scheduler__pb2.EncodeSendRequest.SerializeToString,
+                response_deserializer=sglang__scheduler__pb2.EncodeSendResponse.FromString,
+                _registered_method=True)
+        self.SchedulerReceiveUrl = channel.unary_unary(
+                '/sglang.grpc.scheduler.SglangScheduler/SchedulerReceiveUrl',
+                request_serializer=sglang__scheduler__pb2.SchedulerReceiveUrlRequest.SerializeToString,
+                response_deserializer=sglang__scheduler__pb2.SchedulerReceiveUrlResponse.FromString,
+                _registered_method=True)
 
 
 class SglangSchedulerServicer(object):
@@ -118,6 +133,31 @@ class SglangSchedulerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Encode(self, request, context):
+        """=====================
+        Encoder RPCs (for EPD mode)
+        =====================
+
+        Encode multimodal items (images/videos/audio) - for encoder workers in EPD mode
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def EncodeSend(self, request, context):
+        """Send encoded embeddings to prefill server (for mooncake backend)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SchedulerReceiveUrl(self, request, context):
+        """Register scheduler receive URL (for zmq_to_scheduler backend)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SglangSchedulerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -150,6 +190,21 @@ def add_SglangSchedulerServicer_to_server(servicer, server):
                     servicer.GetServerInfo,
                     request_deserializer=sglang__scheduler__pb2.GetServerInfoRequest.FromString,
                     response_serializer=sglang__scheduler__pb2.GetServerInfoResponse.SerializeToString,
+            ),
+            'Encode': grpc.unary_unary_rpc_method_handler(
+                    servicer.Encode,
+                    request_deserializer=sglang__scheduler__pb2.EncodeRequest.FromString,
+                    response_serializer=sglang__scheduler__pb2.EncodeResponse.SerializeToString,
+            ),
+            'EncodeSend': grpc.unary_unary_rpc_method_handler(
+                    servicer.EncodeSend,
+                    request_deserializer=sglang__scheduler__pb2.EncodeSendRequest.FromString,
+                    response_serializer=sglang__scheduler__pb2.EncodeSendResponse.SerializeToString,
+            ),
+            'SchedulerReceiveUrl': grpc.unary_unary_rpc_method_handler(
+                    servicer.SchedulerReceiveUrl,
+                    request_deserializer=sglang__scheduler__pb2.SchedulerReceiveUrlRequest.FromString,
+                    response_serializer=sglang__scheduler__pb2.SchedulerReceiveUrlResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -316,6 +371,87 @@ class SglangScheduler(object):
             '/sglang.grpc.scheduler.SglangScheduler/GetServerInfo',
             sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
             sglang__scheduler__pb2.GetServerInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Encode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.scheduler.SglangScheduler/Encode',
+            sglang__scheduler__pb2.EncodeRequest.SerializeToString,
+            sglang__scheduler__pb2.EncodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EncodeSend(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.scheduler.SglangScheduler/EncodeSend',
+            sglang__scheduler__pb2.EncodeSendRequest.SerializeToString,
+            sglang__scheduler__pb2.EncodeSendResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SchedulerReceiveUrl(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.scheduler.SglangScheduler/SchedulerReceiveUrl',
+            sglang__scheduler__pb2.SchedulerReceiveUrlRequest.SerializeToString,
+            sglang__scheduler__pb2.SchedulerReceiveUrlResponse.FromString,
             options,
             channel_credentials,
             insecure,

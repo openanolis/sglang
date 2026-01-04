@@ -78,7 +78,7 @@ class DisaggregatedParams(_message.Message):
     def __init__(self, bootstrap_host: _Optional[str] = ..., bootstrap_port: _Optional[int] = ..., bootstrap_room: _Optional[int] = ...) -> None: ...
 
 class GenerateRequest(_message.Message):
-    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "stream")
+    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "stream", "need_wait_for_image")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     TOKENIZED_FIELD_NUMBER: _ClassVar[int]
     MM_INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -96,6 +96,7 @@ class GenerateRequest(_message.Message):
     LORA_ID_FIELD_NUMBER: _ClassVar[int]
     DATA_PARALLEL_RANK_FIELD_NUMBER: _ClassVar[int]
     STREAM_FIELD_NUMBER: _ClassVar[int]
+    NEED_WAIT_FOR_IMAGE_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     tokenized: TokenizedInput
     mm_inputs: MultimodalInputs
@@ -113,7 +114,8 @@ class GenerateRequest(_message.Message):
     lora_id: str
     data_parallel_rank: int
     stream: bool
-    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., stream: bool = ...) -> None: ...
+    need_wait_for_image: bool
+    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., stream: bool = ..., need_wait_for_image: bool = ...) -> None: ...
 
 class TokenizedInput(_message.Message):
     __slots__ = ("original_text", "input_ids")
@@ -494,3 +496,61 @@ class GetServerInfoResponse(_message.Message):
     server_type: str
     start_time: _timestamp_pb2.Timestamp
     def __init__(self, server_args: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., scheduler_info: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., active_requests: _Optional[int] = ..., is_paused: bool = ..., last_receive_timestamp: _Optional[float] = ..., uptime_seconds: _Optional[float] = ..., sglang_version: _Optional[str] = ..., server_type: _Optional[str] = ..., start_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class EncodeRequest(_message.Message):
+    __slots__ = ("mm_items", "req_id", "num_parts", "part_idx", "prefill_host", "embedding_port")
+    MM_ITEMS_FIELD_NUMBER: _ClassVar[int]
+    REQ_ID_FIELD_NUMBER: _ClassVar[int]
+    NUM_PARTS_FIELD_NUMBER: _ClassVar[int]
+    PART_IDX_FIELD_NUMBER: _ClassVar[int]
+    PREFILL_HOST_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_PORT_FIELD_NUMBER: _ClassVar[int]
+    mm_items: _containers.RepeatedScalarFieldContainer[str]
+    req_id: str
+    num_parts: int
+    part_idx: int
+    prefill_host: str
+    embedding_port: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, mm_items: _Optional[_Iterable[str]] = ..., req_id: _Optional[str] = ..., num_parts: _Optional[int] = ..., part_idx: _Optional[int] = ..., prefill_host: _Optional[str] = ..., embedding_port: _Optional[_Iterable[int]] = ...) -> None: ...
+
+class EncodeResponse(_message.Message):
+    __slots__ = ("embedding_size", "embedding_len", "embedding_dim")
+    EMBEDDING_SIZE_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_LEN_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_DIM_FIELD_NUMBER: _ClassVar[int]
+    embedding_size: int
+    embedding_len: int
+    embedding_dim: int
+    def __init__(self, embedding_size: _Optional[int] = ..., embedding_len: _Optional[int] = ..., embedding_dim: _Optional[int] = ...) -> None: ...
+
+class EncodeSendRequest(_message.Message):
+    __slots__ = ("req_id", "prefill_host", "embedding_port", "session_id", "buffer_address")
+    REQ_ID_FIELD_NUMBER: _ClassVar[int]
+    PREFILL_HOST_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_PORT_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    BUFFER_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    req_id: str
+    prefill_host: str
+    embedding_port: int
+    session_id: str
+    buffer_address: int
+    def __init__(self, req_id: _Optional[str] = ..., prefill_host: _Optional[str] = ..., embedding_port: _Optional[int] = ..., session_id: _Optional[str] = ..., buffer_address: _Optional[int] = ...) -> None: ...
+
+class EncodeSendResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class SchedulerReceiveUrlRequest(_message.Message):
+    __slots__ = ("req_id", "receive_url", "receive_count")
+    REQ_ID_FIELD_NUMBER: _ClassVar[int]
+    RECEIVE_URL_FIELD_NUMBER: _ClassVar[int]
+    RECEIVE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    req_id: str
+    receive_url: str
+    receive_count: int
+    def __init__(self, req_id: _Optional[str] = ..., receive_url: _Optional[str] = ..., receive_count: _Optional[int] = ...) -> None: ...
+
+class SchedulerReceiveUrlResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...

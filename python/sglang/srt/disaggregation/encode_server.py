@@ -6,9 +6,11 @@ import os
 import pickle
 import time
 import traceback
+from concurrent import futures
 from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
+import grpc
 import numpy as np
 import torch
 import uvicorn
@@ -16,6 +18,8 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
+from grpc_health.v1 import health, health_pb2, health_pb2_grpc
+from grpc_reflection.v1alpha import reflection
 from transformers import AutoImageProcessor
 from transformers.image_utils import load_images
 
@@ -28,6 +32,7 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -223,7 +228,7 @@ class MMEncoder:
                 self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
         end_time = time.perf_counter()
         logger.info(
-            f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
+            f"Vit time : {(end_time - start_time) * 1000:.2f} ms {mm_embedding.shape = }"
         )
         if self.profiler is not None:
             self.profiler.step()
@@ -653,3 +658,280 @@ async def stop_profile_async():
     if ok:
         return Response(content="Stop profiling.\n", status_code=200)
     return Response(content=(msg or "Stop profiling failed.\n"), status_code=400)
+
+
+class SGLangEncoderServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
+    """gRPC servicer for encoder-only mode (EPD)."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        encoder_instance: MMEncoder,
+        send_sockets_list: List[zmq.Socket],
+    ):
+        self.server_args = server_args
+        self.encoder = encoder_instance
+        self.send_sockets = send_sockets_list
+        logger.info("gRPC encoder servicer initialized")
+
+    async def Encode(
+        self,
+        request: sglang_scheduler_pb2.EncodeRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.EncodeResponse:
+        """Encode multimodal items."""
+        try:
+            request_dict = {
+                "mm_items": list(request.mm_items),
+                "req_id": request.req_id,
+                "num_parts": request.num_parts,
+                "part_idx": request.part_idx,
+            }
+            for socket in self.send_sockets:
+                socket.send_pyobj(request_dict)
+
+            nbytes, embedding_len, embedding_dim = await self.encoder.encode(
+                mm_items=list(request.mm_items),
+                req_id=request.req_id,
+                num_parts=request.num_parts,
+                part_idx=request.part_idx,
+            )
+
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                return sglang_scheduler_pb2.EncodeResponse(
+                    embedding_size=nbytes,
+                    embedding_len=embedding_len,
+                    embedding_dim=embedding_dim,
+                )
+            elif self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+                embedding_ports = list(request.embedding_port)
+                if not embedding_ports:
+                    await self.encoder.send_with_url(req_id=request.req_id)
+                else:
+                    tasks = [
+                        self.encoder.send(
+                            req_id=request.req_id,
+                            prefill_host=request.prefill_host,
+                            embedding_port=port,
+                        )
+                        for port in embedding_ports
+                    ]
+                    await asyncio.gather(*tasks)
+                    self.encoder.embedding_to_send.pop(request.req_id, None)
+                return sglang_scheduler_pb2.EncodeResponse()
+            elif self.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+                embedding_port = (
+                    request.embedding_port[0] if request.embedding_port else 0
+                )
+                await self.encoder.send(
+                    req_id=request.req_id,
+                    prefill_host=request.prefill_host,
+                    embedding_port=embedding_port,
+                )
+                self.encoder.embedding_to_send.pop(request.req_id, None)
+                return sglang_scheduler_pb2.EncodeResponse()
+
+            return sglang_scheduler_pb2.EncodeResponse()
+
+        except Exception as e:
+            logger.error(f"Encode error: {e}")
+            traceback.print_exc()
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return sglang_scheduler_pb2.EncodeResponse()
+
+    async def EncodeSend(
+        self,
+        request: sglang_scheduler_pb2.EncodeSendRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.EncodeSendResponse:
+        """Send encoded embeddings to prefill server."""
+        try:
+            await self.encoder.send(
+                req_id=request.req_id,
+                prefill_host=request.prefill_host,
+                embedding_port=request.embedding_port,
+                session_id=request.session_id if request.session_id else None,
+                buffer_address=request.buffer_address if request.buffer_address else None,
+            )
+            self.encoder.embedding_to_send.pop(request.req_id, None)
+            return sglang_scheduler_pb2.EncodeSendResponse()
+
+        except Exception as e:
+            logger.error(f"EncodeSend error: {e}")
+            traceback.print_exc()
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return sglang_scheduler_pb2.EncodeSendResponse()
+
+    async def SchedulerReceiveUrl(
+        self,
+        request: sglang_scheduler_pb2.SchedulerReceiveUrlRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.SchedulerReceiveUrlResponse:
+        """Register scheduler receive URL."""
+        try:
+            rid = request.req_id
+            async with rid_lock:
+                if rid not in rid_to_receive_endpoint:
+                    rid_to_receive_endpoint[rid] = set()
+                    rid_to_receive_count[rid] = request.receive_count
+                if rid_to_receive_count[rid] != request.receive_count:
+                    raise ValueError(
+                        f"Mismatched receive_count for {rid}: "
+                        f"expected {rid_to_receive_count[rid]}, got {request.receive_count}"
+                    )
+                rid_to_receive_endpoint[rid].add(request.receive_url)
+            return sglang_scheduler_pb2.SchedulerReceiveUrlResponse()
+
+        except Exception as e:
+            logger.error(f"SchedulerReceiveUrl error: {e}")
+            traceback.print_exc()
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return sglang_scheduler_pb2.SchedulerReceiveUrlResponse()
+
+    async def HealthCheck(
+        self,
+        request: sglang_scheduler_pb2.HealthCheckRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.HealthCheckResponse:
+        return sglang_scheduler_pb2.HealthCheckResponse(
+            healthy=self.encoder is not None, message="encoder ready"
+        )
+
+    async def Generate(self, request, context):
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Generate RPC not available in encoder mode")
+        return sglang_scheduler_pb2.GenerateResponse()
+
+    async def Embed(self, request, context):
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Embed RPC not available in encoder mode")
+        return sglang_scheduler_pb2.EmbedResponse()
+
+    async def Abort(self, request, context):
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Abort RPC not available in encoder mode")
+        return sglang_scheduler_pb2.AbortResponse()
+
+    async def GetModelInfo(self, request, context):
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("GetModelInfo RPC not available in encoder mode")
+        return sglang_scheduler_pb2.GetModelInfoResponse()
+
+    async def GetServerInfo(self, request, context):
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("GetServerInfo RPC not available in encoder mode")
+        return sglang_scheduler_pb2.GetServerInfoResponse()
+
+
+def _launch_grpc_encoder_worker(
+    server_args: ServerArgs, schedule_path: str, dist_init_method: str, rank: int
+):
+    """Launch encoder worker process for gRPC mode."""
+
+    async def run_worker():
+        worker_encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
+        while True:
+            request = await worker_encoder.schedule_socket.recv_pyobj()
+            if isinstance(request, ProfileReq):
+                if request.type == ProfileReqType.START_PROFILE:
+                    if worker_encoder.profiler is None:
+                        worker_encoder.profiler = EncoderProfiler(worker_encoder.rank)
+                    worker_encoder.profiler.start(request)
+                else:
+                    worker_encoder.profiler.stop()
+            else:
+                await worker_encoder.encode(
+                    mm_items=request["mm_items"],
+                    req_id=request["req_id"],
+                    num_parts=request["num_parts"],
+                    part_idx=request["part_idx"],
+                )
+
+    try:
+        asyncio.run(run_worker())
+    except KeyboardInterrupt:
+        logger.info(f"Exit encoder worker rank {rank}")
+    except Exception:
+        traceback.print_exc()
+
+
+async def serve_grpc_encoder(server_args: ServerArgs):
+    """Start the gRPC encoder server for EPD mode."""
+    ctx = mp.get_context("spawn")
+    zmq_ctx = zmq.Context(10)
+    ipc_path_prefix = random_uuid()
+    port_args = PortArgs.init_new(server_args)
+
+    if server_args.dist_init_addr:
+        dist_init_method = f"tcp://{server_args.dist_init_addr}"
+    else:
+        dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
+
+    grpc_send_sockets: List[zmq.Socket] = []
+    for rank in range(1, server_args.tp_size):
+        schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
+        grpc_send_sockets.append(
+            get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)
+        )
+        ctx.Process(
+            target=_launch_grpc_encoder_worker,
+            args=(server_args, schedule_path, dist_init_method, rank),
+            daemon=True,
+        ).start()
+
+    grpc_encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+
+    server = grpc.aio.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=[
+            ("grpc.max_send_message_length", 1024 * 1024 * 256),
+            ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+        ],
+    )
+
+    health_servicer = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+
+    servicer = SGLangEncoderServicer(
+        server_args=server_args,
+        encoder_instance=grpc_encoder,
+        send_sockets_list=grpc_send_sockets,
+    )
+    sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
+
+    SERVICE_NAMES = (
+        sglang_scheduler_pb2.DESCRIPTOR.services_by_name["SglangScheduler"].full_name,
+        "grpc.health.v1.Health",
+        reflection.SERVICE_NAME,
+    )
+    reflection.enable_server_reflection(SERVICE_NAMES, server)
+
+    listen_addr = f"{server_args.host}:{server_args.port}"
+    server.add_insecure_port(listen_addr)
+
+    await server.start()
+    logger.info(f"gRPC encoder server listening on {listen_addr}")
+
+    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+
+    import signal
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def signal_handler():
+        logger.info("Received shutdown signal")
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, signal_handler)
+
+    try:
+        await stop_event.wait()
+    finally:
+        logger.info("Shutting down gRPC encoder server...")
+        health_servicer.set("", health_pb2.HealthCheckResponse.NOT_SERVING)
+        await server.stop(grace=5)

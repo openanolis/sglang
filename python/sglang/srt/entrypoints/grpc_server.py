@@ -11,6 +11,7 @@ import os
 import signal
 import threading
 import time
+import traceback
 from concurrent import futures
 from typing import AsyncIterator, Dict, Optional
 
@@ -18,7 +19,7 @@ import grpc
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
-from grpc_health.v1 import health_pb2_grpc
+from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 import sglang
@@ -34,7 +35,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 
@@ -52,19 +53,19 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self,
         request_manager: GrpcRequestManager,
         server_args: ServerArgs,
-        model_info: Dict,
-        scheduler_info: Dict,
+        model_info: Optional[Dict] = None,
+        scheduler_info: Optional[Dict] = None,
         health_servicer: Optional[SGLangHealthServicer] = None,
     ):
-        """Initialize the standalone gRPC service."""
+        """Initialize the standalone gRPC scheduler service."""
         self.request_manager = request_manager
         self.server_args = server_args
-        self.model_info = model_info
-        self.scheduler_info = scheduler_info
+        self.model_info = model_info or {}
+        self.scheduler_info = scheduler_info or {}
         self.start_time = time.time()
         self.health_servicer = health_servicer
 
-        # Start the request manager's event loop using auto_create_handle_loop
+        # Start the request manager's event loop
         self.request_manager.auto_create_handle_loop()
 
         logger.info("gRPC scheduler servicer initialized")
@@ -326,15 +327,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ),
             weight_version=self.server_args.weight_version or "",
             served_model_name=self.server_args.served_model_name,
-            max_context_length=self.model_info["max_context_length"],
-            vocab_size=self.model_info["vocab_size"],
-            supports_vision=self.model_info["supports_vision"],
+            max_context_length=self.model_info.get("max_context_length", 0),
+            vocab_size=self.model_info.get("vocab_size", 0),
+            supports_vision=self.model_info.get("supports_vision", True),
             model_type=self.model_info.get("model_type") or "",
             architectures=self.model_info.get("architectures") or [],
-            eos_token_ids=self.model_info["eos_token_ids"],
-            pad_token_id=self.model_info["pad_token_id"],
-            bos_token_id=self.model_info["bos_token_id"],
-            max_req_input_len=self.model_info["max_req_input_len"],
+            eos_token_ids=self.model_info.get("eos_token_ids", []),
+            pad_token_id=self.model_info.get("pad_token_id", 0),
+            bos_token_id=self.model_info.get("bos_token_id", 0),
+            max_req_input_len=self.model_info.get("max_req_input_len", 0),
             # Classification model support
             id2label_json=self.model_info.get("id2label_json") or "",
             num_labels=self.model_info.get("num_labels") or 0,
@@ -710,13 +711,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
     async def shutdown(self):
         """Shutdown the service."""
-        logger.info("Shutting down gRPC service")
+        logger.info("Shutting down gRPC scheduler service")
 
         # Mark health service as NOT_SERVING before shutdown
         if self.health_servicer:
             self.health_servicer.set_not_serving()
 
-        # Shutdown request manager (handles its own tasks)
+        # Shutdown request manager
         await self.request_manager.shutdown()
 
 
@@ -725,7 +726,6 @@ async def serve_grpc(
     model_info: Optional[Dict] = None,
 ):
     """Start the standalone gRPC server with integrated scheduler."""
-
     # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
     # This ensures the bootstrap server is ready when prefill schedulers try to register
     bootstrap_server = None
