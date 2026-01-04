@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -32,11 +33,15 @@ class RouterManager:
         decode_urls: Optional[List[str]] = None,
         prefill_policy: Optional[str] = None,
         decode_policy: Optional[str] = None,
+        # EPD options
+        epd_disaggregation: bool = False,
+        encode_urls: Optional[List[tuple]] = None,
+        encode_policy: Optional[str] = None,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
         port = port or find_free_port()
         cmd = [
-            "python3",
+            sys.executable,
             "-m",
             "sglang_router.launch_router",
             "--host",
@@ -66,6 +71,31 @@ class RouterManager:
             if decode_urls:
                 for url in decode_urls:
                     cmd.extend(["--decode", url])
+            if prefill_policy:
+                cmd.extend(["--prefill-policy", prefill_policy])
+            if decode_policy:
+                cmd.extend(["--decode-policy", decode_policy])
+
+        # EPD routing configuration
+        if epd_disaggregation:
+            cmd.append("--epd-disaggregation")
+            if encode_urls:
+                for url, bport in encode_urls:
+                    if bport is None:
+                        cmd.extend(["--encode", url])
+                    else:
+                        cmd.extend(["--encode", url, str(bport)])
+            if prefill_urls:
+                for url, bport in prefill_urls:
+                    if bport is None:
+                        cmd.extend(["--prefill", url, "none"])
+                    else:
+                        cmd.extend(["--prefill", url, str(bport)])
+            if decode_urls:
+                for url in decode_urls:
+                    cmd.extend(["--decode", url])
+            if encode_policy:
+                cmd.extend(["--encode-policy", encode_policy])
             if prefill_policy:
                 cmd.extend(["--prefill-policy", prefill_policy])
             if decode_policy:
