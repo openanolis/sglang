@@ -165,13 +165,14 @@ from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.tracing.trace_metric_wrapper import (
     NullContext,
     RequestStage,
     TraceMetricContext,
-    metric_trace_slice_batch,
+    process_tracing_init,
     trace_event_batch,
+    trace_set_thread_info,
+    trace_slice_batch,
 )
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -2356,7 +2357,7 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
-            metric_trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
+            trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)

@@ -42,12 +42,13 @@ from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
 )
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.tracing.trace_metric_wrapper import (
     NullContext,
     RequestStage,
     TraceMetricContext,
     metric_trace_slice_batch_scope,
+    process_tracing_init,
+    trace_set_thread_info,
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (

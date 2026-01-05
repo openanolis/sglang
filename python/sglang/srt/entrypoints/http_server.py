@@ -138,7 +138,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.tracing.trace_metric_wrapper import (
+    process_tracing_init,
+    trace_set_thread_info,
+)
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,

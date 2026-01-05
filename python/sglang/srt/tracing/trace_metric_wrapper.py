@@ -17,11 +17,34 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
-from sglang.srt.tracing.trace import (
-    TraceReqContext,
+from sglang.srt.tracing.trace import get_opentelemetry_initialized
+from sglang.srt.tracing.trace_async import (
+    TraceReqContextAsync,
+    async_trace_event_batch,
+    async_trace_req_abort_batch,
+    async_trace_slice_end_batch,
     get_cur_time_ns,
-    get_opentelemetry_initialized,
+    process_tracing_init,
+    trace_set_thread_info,
 )
+
+__all__ = [
+    "RequestStage",
+    "TraceMetricContext",
+    "NullContext",
+    "trace_slice_batch",
+    "metric_trace_slice_batch",
+    "metric_trace_slice_batch_scope",
+    "trace_event_batch",
+    "global_init_trace_metric_ctx",
+    "global_get_trace_metric_ctx",
+    "global_set_trace_metric_ctx",
+    "global_del_trace_metric_ctx",
+    "trace_inject_propagate_context",
+    "trace_restore_trace_metric_ctx",
+    "process_tracing_init",
+    "trace_set_thread_info",
+]
 
 
 @dataclass
@@ -139,7 +162,7 @@ class RequestStage:
     ANONYMOUS = RequestStageConfig("")
 
 
-class TraceMetricContext(TraceReqContext):
+class TraceMetricContext(TraceReqContextAsync):
     def __init__(
         self,
         rid,
@@ -308,14 +331,46 @@ def metric_trace_slice_batch(
     stage: RequestStageConfig,
     reqs: List,
 ):
-    if not reqs or not reqs[0].trace_metric_ctx.time_record_enable:
+    if not reqs:
         return
+
+    reqs = [req for req in reqs if req.trace_metric_ctx.time_record_enable]
 
     for req in reqs:
         req.trace_metric_ctx.slice_end(
             stage,
             auto_next_anon=not req.finished(),
             thread_finish_flag=req.finished(),
+        )
+
+
+def trace_slice_batch(
+    stage: RequestStageConfig,
+    reqs: List,
+    auto_next_anon: bool = True,
+):
+    if not reqs:
+        return
+
+    active_rids = [req.rid for req in reqs if req.trace_metric_ctx.time_record_enable]
+    if not active_rids:
+        return
+
+    finished_rids = [req.rid for req in reqs if req.finished()]
+    ts = get_cur_time_ns()
+
+    async_trace_slice_end_batch(
+        stage.stage_name,
+        rids=active_rids,
+        ts=ts,
+        auto_next_anon=auto_next_anon,
+        level=stage.level,
+    )
+
+    if finished_rids:
+        async_trace_req_abort_batch(
+            rids=finished_rids,
+            ts=ts,
         )
 
 
@@ -334,15 +389,24 @@ def trace_event_batch(
     ts: Optional[int] = None,
     attrs: Dict[str, Any] = {},
 ):
-    if not reqs or not reqs[0].trace_metric_ctx.tracing_enable:
+    if not reqs:
+        return
+
+    active_rids = [req.rid for req in reqs if req.trace_metric_ctx.tracing_enable]
+    if not active_rids:
         return
 
     bid = uuid.uuid4().hex[:8]
     _attrs = {"bid": bid, "batch_size": len(reqs)}
     _attrs.update(attrs)
 
-    for req in reqs:
-        req.trace_metric_ctx.trace_event(name, ts=ts, attrs=_attrs)
+    ts = ts or get_cur_time_ns()
+    async_trace_event_batch(
+        name,
+        rids=active_rids,
+        ts=ts,
+        attrs=_attrs,
+    )
 
 
 """

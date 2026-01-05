@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 opentelemetry_imported = False
 opentelemetry_initialized = False
 _trace_context_propagator = None
+tracer = None
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
 
@@ -75,7 +76,6 @@ class TraceThreadInfo:
     thread_label: str
     tp_rank: int
     dp_rank: int
-    tracer: trace.Tracer
 
 
 @dataclass
@@ -89,6 +89,7 @@ class TraceEvent:
 class TraceSliceContext:
     slice_name: str
     start_time_ns: int
+    virt_id: int
     end_time_ns: Optional[int] = None
     span: Optional[trace.span.Span] = None
     # When True, defers slice_name assignment until trace_slice_end()
@@ -101,7 +102,7 @@ class TraceSliceContext:
     events: Optional[List[TraceEvent]] = None
     parent_slice: Optional[TraceSliceContext] = None
     child_slices: Optional[List[TraceSliceContext]] = None
-    prev_span_context: Optional[trace.span.SpanContext] = None
+    prev_span_virt_id: Optional[int] = None
 
 
 @dataclass
@@ -110,25 +111,22 @@ class TraceThreadContext:
     cur_slice: Optional[TraceSliceContext] = None
     thread_span: Optional[trace.span.Span] = None
     # Record the most recently completed span as the previous span for the next span to be created.
-    last_span_context: Optional[trace.span.SpanContext] = None
+    last_span_virt_id: Optional[int] = None
 
 
 @dataclass
 class TracePropagateContext:
     root_span_context: context.Context
-    prev_span_context: Optional[trace.span.SpanContext]
+    prev_span_virt_id: Optional[int]
 
     def to_dict(self):
         carrier: dict[str, str] = {}
         propagate.inject(carrier, self.root_span_context)
 
-        if self.prev_span_context:
+        if self.prev_span_virt_id:
             return {
                 "root_span": carrier,
-                "prev_span": {
-                    "span_id": self.prev_span_context.span_id,
-                    "trace_id": self.prev_span_context.trace_id,
-                },
+                "prev_span": {"virt_id": self.prev_span_virt_id},
             }
         else:
             return {"root_span": carrier, "prev_span": None}
@@ -144,15 +142,11 @@ class TracePropagateContext:
         root_span_context = propagate.extract(carrier)
 
         if d["prev_span"] == "None" or d["prev_span"] is None:
-            prev_span_context = None
+            prev_span_virt_id = None
         else:
-            prev_span_context = trace.span.SpanContext(
-                trace_id=d["prev_span"]["trace_id"],
-                span_id=d["prev_span"]["span_id"],
-                is_remote=True,
-            )
+            prev_span_virt_id = d["prev_span"]["virt_id"]
 
-        return cls(root_span_context, prev_span_context)
+        return cls(root_span_context, prev_span_virt_id)
 
 
 class TraceCustomIdGenerator(id_generator.IdGenerator):
@@ -205,6 +199,7 @@ def __get_host_id() -> str:
 def process_tracing_init(otlp_endpoint, server_name):
     global opentelemetry_initialized
     global get_cur_time_ns
+    global tracer
     if not opentelemetry_imported:
         opentelemetry_initialized = False
         raise RuntimeError(
@@ -235,6 +230,7 @@ def process_tracing_init(otlp_endpoint, server_name):
         )
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
+        tracer = trace.get_tracer("sglang server")
     except Exception as e:
         opentelemetry_initialized = False
         raise RuntimeError(
@@ -281,8 +277,9 @@ def trace_set_thread_info(
         thread_label=thread_label,
         tp_rank=tp_rank,
         dp_rank=dp_rank,
-        tracer=trace.get_tracer("sglang server"),
     )
+
+    return threads_info[pid]
 
 
 class TraceReqContext:
@@ -316,6 +313,34 @@ class TraceReqContext:
 
         self.pid: int = threading.get_native_id()
 
+    def __getstate__(self):
+        state = {
+            "tracing_enable": self.tracing_enable,
+            "rid": self.rid,
+            "bootstrap_room": self.bootstrap_room,
+            "start_time_ns": self.start_time_ns,
+            "role": self.role,
+            "trace_level": self.trace_level,
+            "module_name": self.module_name,
+            "is_copy": self.is_copy,
+            "pid": self.pid,
+            "thread_context": None,
+            "root_span": None,
+            "root_span_context": None,
+        }
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    @classmethod
+    def from_instance(cls, instance):
+        expected_attrs = cls.__init__.__code__.co_varnames[1:]
+        kwargs = {k: getattr(instance, k) for k in expected_attrs if hasattr(instance, k)}
+        obj = cls(**kwargs)
+        obj.pid = instance.pid
+        return obj
+
     def is_tracing_enabled(self) -> bool:
         return self.tracing_enable
 
@@ -332,7 +357,7 @@ class TraceReqContext:
         if thread_info.tp_rank is not None:
             thread_name += f" [TP {thread_info.tp_rank}] "
         thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
-        thread_context.thread_span = thread_context.thread_info.tracer.start_span(
+        thread_context.thread_span = tracer.start_span(
             name=thread_name,
             start_time=ts,
             context=self.root_span_context,
@@ -358,26 +383,26 @@ class TraceReqContext:
         if not self.root_span_context:
             return None
 
-        prev_span_context = None
+        prev_span_virt_id = None
         if self.thread_context.cur_slice:
             cur_slice = self.thread_context.cur_slice
             if cur_slice.span:
-                prev_span_context = cur_slice.span.get_span_context()
+                prev_span_virt_id = cur_slice.prev_span_virt_id
 
-        if not prev_span_context:
+        if not prev_span_virt_id:
             # may be None
-            prev_span_context = self.thread_context.last_span_context
+            prev_span_virt_id = self.thread_context.last_span_virt_id
 
         root_span_context = self.root_span_context
 
-        trace_context = TracePropagateContext(root_span_context, prev_span_context)
+        trace_context = TracePropagateContext(root_span_context, prev_span_virt_id)
         return trace_context.to_dict()
 
-    def trace_set_proc_propagate_context(self, trace_context: Optional[Dict[str, Any]]):
+    def trace_set_proc_propagate_context(self, trace_context: Optional[Dict[str, Any]], ts = None):
         if not self.tracing_enable:
             return
 
-        self.start_time_ns = get_cur_time_ns()
+        self.start_time_ns = ts or get_cur_time_ns()
         self.is_copy = True
 
         trace_context = TracePropagateContext.instance_from_dict(trace_context)
@@ -388,22 +413,16 @@ class TraceReqContext:
             self.root_span_context = trace_context.root_span_context
 
         self.thread_context = self.__create_thread_context(self.start_time_ns)
-        self.thread_context.last_span_context = trace_context.prev_span_context
+        self.thread_context.last_span_virt_id = trace_context.prev_span_virt_id
 
-    def trace_req_start(
-        self,
-        ts: Optional[int] = None,
-        external_trace_header: Optional[Dict[str, str]] = None,
+    def _create_root_span(
+        self, ts: int, external_trace_header: Optional[Dict[str, str]]
     ):
-        if not self.tracing_enable:
-            return
-
         ts = ts or get_cur_time_ns()
 
         # create req context and root span
         self.start_time_ns = ts
 
-        tracer = threads_info[self.pid].tracer
         external_trace_context = _trace_context_propagator.extract(
             external_trace_header or {}
         )
@@ -423,6 +442,17 @@ class TraceReqContext:
 
         self.root_span = root_span
         self.root_span_context = trace.set_span_in_context(root_span)
+
+    def trace_req_start(
+        self,
+        ts: Optional[int] = None,
+        external_trace_header: Optional[Dict[str, str]] = None,
+    ):
+        if not self.tracing_enable:
+            return
+
+        ts = ts or get_cur_time_ns()
+        self._create_root_span(ts, external_trace_header)
 
         # create thread context and thread span
         self.thread_context = self.__create_thread_context(ts)
@@ -452,14 +482,15 @@ class TraceReqContext:
             parent_span = _slice.parent_slice.span
 
         parent_span_context = trace.set_span_in_context(parent_span)
-        span = self.thread_context.thread_info.tracer.start_span(
+        span = tracer.start_span(
             name=_slice.slice_name,
             start_time=_slice.start_time_ns,
             context=parent_span_context,
         )
 
-        if _slice.prev_span_context:
-            span.add_link(_slice.prev_span_context)
+        span.set_attributes({"virt_id": _slice.virt_id})
+        if _slice.prev_span_virt_id:
+            span.set_attributes({"prev_span_virt_id": _slice.prev_span_virt_id})
 
         _slice.span = span
 
@@ -495,6 +526,7 @@ class TraceReqContext:
         ts: Optional[int] = None,
         anonymous: bool = False,
         level: int = 1,
+        virt_id: Optional[int] = None,
     ):
         if not self.tracing_enable:
             return
@@ -504,9 +536,11 @@ class TraceReqContext:
 
         ts = ts or get_cur_time_ns()
 
+        virt_id = virt_id or uuid.uuid4().hex[:8]
         cur_slice = TraceSliceContext(
             slice_name=name,
             start_time_ns=ts,
+            virt_id=virt_id,
             anonymous=anonymous,
             level=level,
             attrs={},
@@ -524,8 +558,8 @@ class TraceReqContext:
 
         # find prev span, only first level slice has previous span
         if not cur_slice.parent_slice:
-            if self.thread_context.last_span_context:
-                cur_slice.prev_span_context = self.thread_context.last_span_context
+            if self.thread_context.last_span_virt_id:
+                cur_slice.prev_span_virt_id = self.thread_context.last_span_virt_id
 
         # check if span creation is lazy
         if anonymous or (cur_slice.parent_slice and cur_slice.parent_slice.lazy_flag):
@@ -622,7 +656,7 @@ class TraceReqContext:
         self.thread_context.cur_slice = cur_slice.parent_slice
         # only for first level slice
         if not cur_slice.parent_slice:
-            self.thread_context.last_span_context = span.get_span_context()
+            self.thread_context.last_span_virt_id = cur_slice.virt_id
         else:
             cur_slice.parent_slice.child_slices.remove(cur_slice)
         self.__end_slice_span(cur_slice)
