@@ -113,6 +113,8 @@ class TraceMessage:
                 continue
             req_ctx.abort(ts=self.ts, abort_info=self.attrs)
 
+        trace_context_table.expire()
+
     def _trace_set_thread_info_process(self):
         threads_info[self.thread_info.pid] = self.thread_info
 
