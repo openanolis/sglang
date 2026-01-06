@@ -336,7 +336,9 @@ class TraceReqContext:
     @classmethod
     def from_instance(cls, instance):
         expected_attrs = cls.__init__.__code__.co_varnames[1:]
-        kwargs = {k: getattr(instance, k) for k in expected_attrs if hasattr(instance, k)}
+        kwargs = {
+            k: getattr(instance, k) for k in expected_attrs if hasattr(instance, k)
+        }
         obj = cls(**kwargs)
         obj.pid = instance.pid
         return obj
@@ -398,7 +400,9 @@ class TraceReqContext:
         trace_context = TracePropagateContext(root_span_context, prev_span_virt_id)
         return trace_context.to_dict()
 
-    def trace_set_proc_propagate_context(self, trace_context: Optional[Dict[str, Any]], ts = None):
+    def trace_set_proc_propagate_context(
+        self, trace_context: Optional[Dict[str, Any]], ts=None
+    ):
         if not self.tracing_enable:
             return
 

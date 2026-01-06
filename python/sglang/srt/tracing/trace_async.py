@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import logging
 import math
 import multiprocessing as mp
@@ -32,12 +33,15 @@ ipc_name = None
 worker_process = None
 sender_socket = None
 
+
 def py_debug(text):
     import threading
+
     pid = threading.get_native_id()
     text = f"[PID: {pid}] {text}"
     with open("/tmp/debug.txt", "a") as f:
         print(text, file=f)
+
 
 class TraceContextTable(TTLCache):
     def __init__(self, ttl):
@@ -101,7 +105,7 @@ class TraceMessage:
     def _trace_req_start_process(self):
         assert len(self.rids) == 1
         rid = self.rids[0]
-        #convert TraceReqContextAsync to TraceReqContext
+        # convert TraceReqContextAsync to TraceReqContext
         self.req_ctx = TraceReqContext.from_instance(self.req_ctx)
         self.req_ctx.trace_set_proc_propagate_context(self.propagate_ctx, self.ts)
         trace_context_table[rid] = self.req_ctx
@@ -148,7 +152,7 @@ class TraceMessage:
             req_ctx = trace_context_table.get(rid)
             if not req_ctx:
                 continue
-            req_ctx.trace_slice_add_attr( self.attrs)
+            req_ctx.trace_slice_add_attr(self.attrs)
 
     def _trace_event_process(self):
         for rid in self.rids:
@@ -165,6 +169,7 @@ class TraceMessage:
         for action in self.actions:
             method = getattr(self, self.action_process[action])
             method()
+
 
 class TraceReqContextAsync(TraceReqContext):
     def __init__(
@@ -368,6 +373,7 @@ class TraceReqContextAsync(TraceReqContext):
         if sender_socket:
             self.abort(abort_info={"abort_info": "have unclosed span, auto closed"})
 
+
 def async_trace_event_batch(
     name: str,
     rids: List,
@@ -444,7 +450,7 @@ def async_trace_worker(ipc_name, otlp_endpoint, server_name, init_event):
             try:
                 msg = receiver_socket.recv_pyobj(zmq.NOBLOCK)
                 msg.process()
-                
+
             except zmq.Again:
                 time.sleep(0.01)  # Small delay to prevent busy waiting
     except KeyboardInterrupt:
@@ -479,6 +485,7 @@ def process_tracing_init(otlp_endpoint, server_name):
 
     context = zmq.Context()
     sender_socket = get_zmq_socket(context, zmq.PUSH, ipc_name, False)
+
 
 def trace_set_thread_info(
     thread_label: str, tp_rank: Optional[int] = None, dp_rank: Optional[int] = None
