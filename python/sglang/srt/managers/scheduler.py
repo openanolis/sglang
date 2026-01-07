@@ -2813,13 +2813,18 @@ class Scheduler(
     def _req_trace_metric_ctx_init(
         self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
     ):
-        if self.server_args.trace_level == 0 and not self.server_args.enable_metrics:
+        propagation_context = req.trace_metric_ctx
+
+        if propagation_context is None and not self.server_args.enable_metrics:
             req.trace_metric_ctx = NullContext()
             return
 
+        trace_level = (
+            0 if propagation_context is None else propagation_context["trace_level"]
+        )
+
         bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None
 
-        propagation_context = req.trace_metric_ctx
         req.trace_metric_ctx = TraceMetricContext(
             req.rid,
             bootstrap_room,
@@ -2828,6 +2833,7 @@ class Scheduler(
             metrics_collector=(
                 self.metrics_collector if self.server_args.enable_metrics else None
             ),
+            trace_level=trace_level,
         )
         req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
         req.trace_metric_ctx.slice_start(RequestStage.ANONYMOUS)

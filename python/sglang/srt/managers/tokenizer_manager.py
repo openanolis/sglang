@@ -91,6 +91,7 @@ from sglang.srt.tracing.trace import extract_trace_headers
 from sglang.srt.tracing.trace_metric_wrapper import (
     RequestStage,
     TraceMetricContext,
+    get_global_trace_level,
     global_del_trace_metric_ctx,
     global_get_trace_metric_ctx,
     global_set_trace_metric_ctx,
@@ -477,7 +478,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
-        if self.server_args.trace_level > 0:
+        if get_global_trace_level() > 0:
             self._req_trace_metric_ctx_init(obj, created_time, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)

@@ -23,6 +23,17 @@ from sglang.srt.tracing.trace import (
     get_opentelemetry_initialized,
 )
 
+global_trace_level = 0
+
+
+def set_global_trace_level(level):
+    global global_trace_level
+    global_trace_level = level
+
+
+def get_global_trace_level():
+    return global_trace_level
+
 
 @dataclass
 class RequestStageConfig:
@@ -148,6 +159,7 @@ class TraceMetricContext(TraceReqContext):
         server_args,
         metrics_collector=None,
         role: Optional[str] = None,
+        trace_level: Optional[int] = None,
     ):
         self.enable_metrics = getattr(server_args, "enable_metrics", False)
         self.metrics_collector = metrics_collector
@@ -156,7 +168,8 @@ class TraceMetricContext(TraceReqContext):
         self.last_ts_stack = []
 
         opentelemetry_initialized = get_opentelemetry_initialized()
-        trace_level = getattr(server_args, "trace_level", 0)
+        if trace_level is None:
+            trace_level = global_trace_level
         tracing_enable = (
             True
             if getattr(server_args, "trace_module", None) == module_name
@@ -287,6 +300,9 @@ class TraceMetricScope:
 class NullContext:
     tracing_enable: bool = False
     time_record_enable: bool = False
+
+    def trace_get_proc_propagate_context():
+        return None
 
     def __getattr__(self, name):
         return self

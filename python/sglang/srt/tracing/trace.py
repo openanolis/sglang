@@ -117,6 +117,7 @@ class TraceThreadContext:
 class TracePropagateContext:
     root_span_context: context.Context
     prev_span_context: Optional[trace.span.SpanContext]
+    trace_level: int
 
     def to_dict(self):
         carrier: dict[str, str] = {}
@@ -129,9 +130,14 @@ class TracePropagateContext:
                     "span_id": self.prev_span_context.span_id,
                     "trace_id": self.prev_span_context.trace_id,
                 },
+                "trace_level": self.trace_level,
             }
         else:
-            return {"root_span": carrier, "prev_span": None}
+            return {
+                "root_span": carrier,
+                "prev_span": None,
+                "trace_level": self.trace_level,
+            }
 
     @classmethod
     def instance_from_dict(cls, d):
@@ -142,6 +148,7 @@ class TracePropagateContext:
 
         carrier = d["root_span"]
         root_span_context = propagate.extract(carrier)
+        trace_level = d["trace_level"]
 
         if d["prev_span"] == "None" or d["prev_span"] is None:
             prev_span_context = None
@@ -152,7 +159,7 @@ class TracePropagateContext:
                 is_remote=True,
             )
 
-        return cls(root_span_context, prev_span_context)
+        return cls(root_span_context, prev_span_context, trace_level)
 
 
 class TraceCustomIdGenerator(id_generator.IdGenerator):
@@ -370,7 +377,9 @@ class TraceReqContext:
 
         root_span_context = self.root_span_context
 
-        trace_context = TracePropagateContext(root_span_context, prev_span_context)
+        trace_context = TracePropagateContext(
+            root_span_context, prev_span_context, self.trace_level
+        )
         return trace_context.to_dict()
 
     def trace_set_proc_propagate_context(self, trace_context: Optional[Dict[str, Any]]):
@@ -389,6 +398,7 @@ class TraceReqContext:
 
         self.thread_context = self.__create_thread_context(self.start_time_ns)
         self.thread_context.last_span_context = trace_context.prev_span_context
+        self.trace_level = trace_context.trace_level
 
     def trace_req_start(
         self,

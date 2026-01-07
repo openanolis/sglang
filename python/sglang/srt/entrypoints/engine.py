@@ -68,6 +68,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.tracing.trace_metric_wrapper import set_global_trace_level
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -192,6 +193,7 @@ class Engine(EngineBase):
             elif server_args.disaggregation_mode == "decode":
                 thread_label = "Decode Tokenizer"
             trace_set_thread_info(thread_label)
+            set_global_trace_level(server_args.trace_level)
 
         try:
             self.loop = asyncio.get_running_loop()

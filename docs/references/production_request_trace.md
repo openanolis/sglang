@@ -35,6 +35,14 @@ This section explains how to configure the request tracing and export the trace 
 
     Replace `0.0.0.0:4317` with the actual endpoint of the OpenTelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.
 
+    The meanings of different trace level values are as follows:
+    ```
+    0: disable tracing
+    1: Trace important slices
+    2: Trace all slices except nested ones
+    3: Trace all slices
+    ```
+
     To use the HTTP/protobuf span exporter, set the following environment variable and point to an HTTP endpoint, for example, `http://0.0.0.0:4318/v1/traces`.
     ```bash
     export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
@@ -45,6 +53,16 @@ This section explains how to configure the request tracing and export the trace 
 5. Observe whether trace data is being exported
     * Access port 16686 of Jaeger using a web browser to visualize the request traces.
     * The OpenTelemetry Collector also exports trace data in JSON format to /tmp/otel_trace.json. In a follow-up patch, we will provide a tool to convert this data into a Perfetto-compatible format, enabling visualization of requests in the Perfetto UI.
+
+6. Dynamic adjustment of trace level
+
+    You can adjust the trace level through the following HTTP API:
+    ```bash
+    curl http://0.0.0.0:30000/set_trace_level?level=2
+    ```
+    Replace `0.0.0.0:30000` with your actual server address, and replace `level=2` with with the level you want to set.
+
+    **Note**: You must set the parameter `--trace-level` greater than 0 when starting the server; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level. This is because the server needs to initialize the OpenTelemetry (OTEL) connection at startup based on whether `trace_level` is greater than 0.
 
 ## How to add Tracing for slices you're interested in?(API introduction)
 We have already inserted instrumentation points in the tokenizer and scheduler main threads. If you wish to trace additional request execution segments or perform finer-grained tracing, please use the APIs from the tracing package as described below.
@@ -104,12 +122,14 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
 5. When the request execution flow transfers to another thread, the trace context needs to be explicitly propagated.
     - sender: Execute the following code before sending the request to another thread via ZMQ
         ```python
-        trace_context = trace_metric_ctx.trace_get_proc_propagate_context(rid)
+        trace_context = trace_metric_ctx.trace_get_proc_propagate_context()
         req.trace_metric_ctx = trace_context
         ```
     - receiver: Execute the following code after receiving the request via ZMQ
         ```python
-        trace_metric_ctx = TraceMetricContext(......,propagation_context = req.trace_metric_ctx)
+        propagation_context = req.trace_metric_ctx
+        req.trace_metric_ctx = TraceMetricContext(......,trace_level = propagation_context["trace_level"])
+        req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
         ```
 
 ## How to Extend the Tracing Framework to Support Complex Tracing Scenarios

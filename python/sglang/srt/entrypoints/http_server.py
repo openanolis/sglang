@@ -37,6 +37,8 @@ from typing import (
     Union,
 )
 
+from sglang.srt.tracing.trace_metric_wrapper import set_global_trace_level
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -46,7 +48,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -264,6 +266,7 @@ async def lifespan(fast_api_app: FastAPI):
         elif server_args.disaggregation_mode == "decode":
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
+        set_global_trace_level(server_args.trace_level)
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -748,6 +751,16 @@ async def stop_profile_async():
     await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/set_trace_level", methods=["GET", "POST"])
+def set_trace_level(level: int = Query(..., gt=0)):
+    set_global_trace_level(level)
+
+    return Response(
+        content="success",
         status_code=200,
     )
 

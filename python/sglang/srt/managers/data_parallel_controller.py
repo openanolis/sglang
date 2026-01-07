@@ -221,7 +221,8 @@ class DataParallelController:
     def _req_trace_metric_ctx_init(
         self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
     ):
-        if self.server_args.trace_level == 0:
+        propagation_context = req.trace_metric_ctx
+        if propagation_context is None:
             req.trace_metric_ctx = NullContext()
             return
 
@@ -233,6 +234,7 @@ class DataParallelController:
             bootstrap_room,
             module_name="request",
             server_args=self.server_args,
+            trace_level=propagation_context["trace_level"],
         )
         req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
 
