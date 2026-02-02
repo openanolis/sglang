@@ -126,7 +126,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             deepstack_embeds = self.get_deepstack_embeds(
                 layer_idx - 1,
                 input_deepstack_embeds,
-                target_batch_size=residual.shape[0] if residual is not None else None,
+                target_batch_size=hidden_states.shape[0],
             )
 
             hidden_states, residual = layer(
@@ -141,7 +141,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         last_deepstack = self.get_deepstack_embeds(
             self.end_layer - 1,
             input_deepstack_embeds,
-            target_batch_size=residual.shape[0] if residual is not None else None,
+            target_batch_size=hidden_states.shape[0],
         )
 
         if not self.pp_group.is_last_rank:
