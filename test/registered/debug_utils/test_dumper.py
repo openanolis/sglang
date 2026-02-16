@@ -1,4 +1,3 @@
-import os
 import sys
 import time
 from pathlib import Path
@@ -8,6 +7,14 @@ import requests
 import torch
 import torch.distributed as dist
 
+from sglang.srt.debug_utils.dumper import (
+    _Dumper,
+    _obj_to_dict,
+    _torch_save,
+    get_tensor_info,
+    get_truncated_value,
+)
+from sglang.srt.environ import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import run_distributed_test
 
@@ -17,8 +24,6 @@ register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
 
 class TestDumperPureFunctions:
     def test_get_truncated_value(self):
-        from sglang.srt.debug_utils.dumper import get_truncated_value
-
         assert get_truncated_value(None) is None
         assert get_truncated_value(42) == 42
         assert len(get_truncated_value((torch.randn(10), torch.randn(20)))) == 2
@@ -26,8 +31,6 @@ class TestDumperPureFunctions:
         assert get_truncated_value(torch.randn(100, 100)).shape == (5, 5)
 
     def test_obj_to_dict(self):
-        from sglang.srt.debug_utils.dumper import _obj_to_dict
-
         assert _obj_to_dict({"a": 1}) == {"a": 1}
 
         class Obj:
@@ -41,8 +44,6 @@ class TestDumperPureFunctions:
         assert "method" not in result
 
     def test_get_tensor_info(self):
-        from sglang.srt.debug_utils.dumper import get_tensor_info
-
         info = get_tensor_info(torch.randn(10, 10))
         for key in ["shape=", "dtype=", "min=", "max=", "mean="]:
             assert key in info
@@ -53,8 +54,6 @@ class TestDumperPureFunctions:
 
 class TestTorchSave:
     def test_normal(self, tmp_path):
-        from sglang.srt.debug_utils.dumper import _torch_save
-
         path = str(tmp_path / "a.pt")
         tensor = torch.randn(3, 3)
 
@@ -63,8 +62,6 @@ class TestTorchSave:
         assert torch.equal(torch.load(path, weights_only=True), tensor)
 
     def test_parameter_fallback(self, tmp_path):
-        from sglang.srt.debug_utils.dumper import _torch_save
-
         class BadParam(torch.nn.Parameter):
             def __reduce_ex__(self, protocol):
                 raise RuntimeError("not pickleable")
@@ -77,8 +74,6 @@ class TestTorchSave:
         assert torch.equal(torch.load(path, weights_only=True), param.data)
 
     def test_silent_skip(self, tmp_path, capsys):
-        from sglang.srt.debug_utils.dumper import _torch_save
-
         path = str(tmp_path / "c.pt")
 
         _torch_save({"fn": lambda: None}, path)
@@ -90,11 +85,15 @@ class TestTorchSave:
 
 class TestDumperDistributed:
     def test_basic(self, tmp_path):
-        run_distributed_test(self._test_basic_func, tmpdir=str(tmp_path))
+        with temp_set_env(
+            allow_sglang=True,
+            SGLANG_DUMPER_ENABLE="1",
+            SGLANG_DUMPER_DIR=str(tmp_path),
+        ):
+            run_distributed_test(self._test_basic_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_basic_func(rank, tmpdir):
-        os.environ["SGLANG_DUMPER_DIR"] = tmpdir
         from sglang.srt.debug_utils.dumper import dumper
 
         tensor = torch.randn(10, 10, device=f"cuda:{rank}")
@@ -124,11 +123,11 @@ class TestDumperDistributed:
         )
 
     def test_http_enable(self):
-        run_distributed_test(self._test_http_func)
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
+            run_distributed_test(self._test_http_func)
 
     @staticmethod
     def _test_http_func(rank):
-        os.environ["SGLANG_DUMPER_ENABLE"] = "0"
         from sglang.srt.debug_utils.dumper import dumper
 
         assert not dumper._enable
@@ -145,11 +144,15 @@ class TestDumperDistributed:
             assert dumper._enable == enable
 
     def test_file_content_correctness(self, tmp_path):
-        run_distributed_test(self._test_file_content_func, tmpdir=str(tmp_path))
+        with temp_set_env(
+            allow_sglang=True,
+            SGLANG_DUMPER_ENABLE="1",
+            SGLANG_DUMPER_DIR=str(tmp_path),
+        ):
+            run_distributed_test(self._test_file_content_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_file_content_func(rank, tmpdir):
-        os.environ["SGLANG_DUMPER_DIR"] = tmpdir
         from sglang.srt.debug_utils.dumper import dumper
 
         tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
@@ -159,18 +162,26 @@ class TestDumperDistributed:
 
         dist.barrier()
         path = _find_dump_file(tmpdir, rank=rank, name="content_check")
-        loaded = torch.load(path, map_location="cpu", weights_only=True)
-        assert torch.equal(loaded, tensor.cpu())
+        raw = _load_dump(path)
+        assert isinstance(raw, dict), f"Expected dict, got {type(raw)}"
+        assert "value" in raw and "meta" in raw
+        assert torch.equal(raw["value"], tensor.cpu())
+        assert raw["meta"]["name"] == "content_check"
+        assert raw["meta"]["rank"] == rank
 
 
 class TestDumperFileWriteControl:
     def test_filter(self, tmp_path):
-        run_distributed_test(self._test_filter_func, tmpdir=str(tmp_path))
+        with temp_set_env(
+            allow_sglang=True,
+            SGLANG_DUMPER_ENABLE="1",
+            SGLANG_DUMPER_DIR=str(tmp_path),
+            SGLANG_DUMPER_FILTER="^keep",
+        ):
+            run_distributed_test(self._test_filter_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_filter_func(rank, tmpdir):
-        os.environ["SGLANG_DUMPER_DIR"] = tmpdir
-        os.environ["SGLANG_DUMPER_FILTER"] = "^keep"
         from sglang.srt.debug_utils.dumper import dumper
 
         dumper.on_forward_pass_start()
@@ -187,12 +198,16 @@ class TestDumperFileWriteControl:
         )
 
     def test_write_disabled(self, tmp_path):
-        run_distributed_test(self._test_write_disabled_func, tmpdir=str(tmp_path))
+        with temp_set_env(
+            allow_sglang=True,
+            SGLANG_DUMPER_ENABLE="1",
+            SGLANG_DUMPER_DIR=str(tmp_path),
+            SGLANG_DUMPER_WRITE_FILE="0",
+        ):
+            run_distributed_test(self._test_write_disabled_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_write_disabled_func(rank, tmpdir):
-        os.environ["SGLANG_DUMPER_DIR"] = tmpdir
-        os.environ["SGLANG_DUMPER_WRITE_FILE"] = "0"
         from sglang.srt.debug_utils.dumper import dumper
 
         dumper.on_forward_pass_start()
@@ -202,11 +217,15 @@ class TestDumperFileWriteControl:
         assert len(_get_filenames(tmpdir)) == 0
 
     def test_save_false(self, tmp_path):
-        run_distributed_test(self._test_save_false_func, tmpdir=str(tmp_path))
+        with temp_set_env(
+            allow_sglang=True,
+            SGLANG_DUMPER_ENABLE="1",
+            SGLANG_DUMPER_DIR=str(tmp_path),
+        ):
+            run_distributed_test(self._test_save_false_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        os.environ["SGLANG_DUMPER_DIR"] = tmpdir
         from sglang.srt.debug_utils.dumper import dumper
 
         dumper.on_forward_pass_start()
@@ -214,6 +233,54 @@ class TestDumperFileWriteControl:
 
         dist.barrier()
         assert len(_get_filenames(tmpdir)) == 0
+
+
+class TestDumpDictFormat:
+    """Verify that dump files use the dict output format: {"value": ..., "meta": {...}}."""
+
+    def test_dict_format_structure(self, tmp_path):
+        dumper = _make_test_dumper(tmp_path)
+        tensor = torch.randn(4, 4)
+        dumper.dump("fmt_test", tensor, custom_key="hello")
+
+        path = _find_dump_file(str(tmp_path), rank=0, name="fmt_test")
+        raw = _load_dump(path)
+
+        assert isinstance(raw, dict)
+        assert set(raw.keys()) == {"value", "meta"}
+        assert torch.equal(raw["value"], tensor)
+
+        meta = raw["meta"]
+        assert meta["name"] == "fmt_test"
+        assert meta["custom_key"] == "hello"
+        assert "forward_pass_id" in meta
+        assert "rank" in meta
+        assert "dump_index" in meta
+
+    def test_dict_format_with_context(self, tmp_path):
+        dumper = _make_test_dumper(tmp_path)
+        dumper.set_ctx(ctx_val=42)
+        tensor = torch.randn(2, 2)
+        dumper.dump("ctx_fmt", tensor)
+
+        path = _find_dump_file(str(tmp_path), rank=0, name="ctx_fmt")
+        raw = _load_dump(path)
+
+        assert raw["meta"]["ctx_val"] == 42
+        assert torch.equal(raw["value"], tensor)
+
+
+def _make_test_dumper(tmp_path: Path, **overrides) -> _Dumper:
+    """Create a _Dumper for CPU testing without HTTP server or distributed."""
+    defaults: dict = dict(
+        enable=True,
+        base_dir=tmp_path,
+        partial_name="test",
+        enable_http_server=False,
+    )
+    d = _Dumper(**{**defaults, **overrides})
+    d.on_forward_pass_start()
+    return d
 
 
 def _get_filenames(tmpdir):
@@ -229,7 +296,12 @@ def _assert_files(filenames, *, exist=(), not_exist=()):
         ), f"{p} should not exist in {filenames}"
 
 
-def _find_dump_file(tmpdir, *, rank: int, name: str) -> Path:
+def _load_dump(path: Path) -> dict:
+    """Load a dump file and return the raw dict (with 'value' and 'meta' keys)."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
     matches = [
         f
         for f in Path(tmpdir).glob("sglang_dump_*/*.pt")
