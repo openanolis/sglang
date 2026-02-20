@@ -1,5 +1,8 @@
+import io
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,7 @@ import torch.distributed as dist
 from sglang.srt.debug_utils.dumper import (
     _collect_megatron_parallel_info,
     _collect_sglang_parallel_info,
+    _collective_with_timeout,
     _Dumper,
     _materialize_value,
     _obj_to_dict,
@@ -23,6 +27,17 @@ from sglang.test.test_utils import run_distributed_test
 
 register_cuda_ci(est_time=30, suite="nightly-2-gpu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
+
+
+@contextmanager
+def _capture_stdout():
+    captured = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        yield captured
+    finally:
+        sys.stdout = old_stdout
 
 
 class TestDumperPureFunctions:
@@ -86,6 +101,34 @@ class TestTorchSave:
         assert "skip the tensor" in captured.out
 
 
+class TestCollectiveTimeout:
+    def test_watchdog_fires_on_timeout(self):
+        block_event = threading.Event()
+        output = ""
+
+        def run_with_timeout():
+            nonlocal output
+            with _capture_stdout() as captured:
+                _collective_with_timeout(
+                    lambda: block_event.wait(),
+                    operation_name="test_blocked_op",
+                    timeout_seconds=2,
+                )
+            output = captured.getvalue()
+
+        worker = threading.Thread(target=run_with_timeout)
+        worker.start()
+
+        time.sleep(4)
+        block_event.set()
+        worker.join(timeout=5)
+
+        print(f"Captured output: {output!r}")
+        assert "WARNING" in output
+        assert "test_blocked_op" in output
+        assert "2s" in output
+
+
 class TestDumperDistributed:
     def test_basic(self, tmp_path):
         with temp_set_env(
@@ -124,6 +167,32 @@ class TestDumperDistributed:
             exist=["tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b"],
             not_exist=["tensor_skip"],
         )
+
+    def test_collective_timeout(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="1"):
+            run_distributed_test(self._test_collective_timeout_func)
+
+    @staticmethod
+    def _test_collective_timeout_func(rank):
+        dumper = _Dumper(
+            enable=True,
+            base_dir=Path("/tmp"),
+            partial_name=None,
+            enable_http_server=False,
+            collective_timeout=3,
+        )
+
+        with _capture_stdout() as captured:
+            if rank != 0:
+                time.sleep(6)
+            dumper.on_forward_pass_start()
+
+        output = captured.getvalue()
+        print(f"Rank {rank} captured output: {output!r}")
+
+        if rank == 0:
+            assert "WARNING" in output, f"Expected WARNING in rank 0 output: {output}"
+            assert "has not completed after 3s" in output
 
     def test_http_enable(self):
         with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
@@ -200,25 +269,6 @@ class TestDumperFileWriteControl:
             not_exist=["skip_this", "not_keep_this"],
         )
 
-    def test_write_disabled(self, tmp_path):
-        with temp_set_env(
-            allow_sglang=True,
-            SGLANG_DUMPER_ENABLE="1",
-            SGLANG_DUMPER_DIR=str(tmp_path),
-            SGLANG_DUMPER_WRITE_FILE="0",
-        ):
-            run_distributed_test(self._test_write_disabled_func, tmpdir=str(tmp_path))
-
-    @staticmethod
-    def _test_write_disabled_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
-        dumper.on_forward_pass_start()
-        dumper.dump("no_write", torch.randn(5, device=f"cuda:{rank}"))
-
-        dist.barrier()
-        assert len(_get_filenames(tmpdir)) == 0
-
     def test_save_false(self, tmp_path):
         with temp_set_env(
             allow_sglang=True,
@@ -236,6 +286,88 @@ class TestDumperFileWriteControl:
 
         dist.barrier()
         assert len(_get_filenames(tmpdir)) == 0
+
+
+class TestOutputControl:
+    def test_file_enabled_by_default(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        d.dump("file_on", torch.randn(3, 3))
+
+        _assert_files(_get_filenames(tmp_path), exist=["file_on"])
+
+    def test_file_disabled(self, tmp_path, capsys):
+        d = _make_test_dumper(tmp_path, enable_output_file=False)
+        d.dump("file_off", torch.randn(3, 3))
+
+        assert len(_get_filenames(tmp_path)) == 0
+        assert "file_off" in capsys.readouterr().out
+
+    def test_console_enabled_by_default(self, tmp_path, capsys):
+        d = _make_test_dumper(tmp_path)
+        d.dump("console_on", torch.randn(3, 3))
+
+        captured = capsys.readouterr()
+        assert "[Dumper.Value]" in captured.out
+        assert "console_on" in captured.out
+
+    def test_console_disabled(self, tmp_path, capsys):
+        d = _make_test_dumper(tmp_path, enable_output_console=False)
+        d.dump("console_off", torch.randn(3, 3))
+
+        assert "console_off" not in capsys.readouterr().out
+        _assert_files(_get_filenames(tmp_path), exist=["console_off"])
+
+    def test_capture_output_basic(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(4, 4)
+
+        with d.capture_output() as captured:
+            d.dump("cap_basic", tensor)
+
+        assert "cap_basic" in captured
+        assert set(captured["cap_basic"].keys()) == {"value", "meta"}
+        assert torch.equal(captured["cap_basic"]["value"], tensor)
+        assert captured["cap_basic"]["meta"]["name"] == "cap_basic"
+
+    def test_capture_output_no_file(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+
+        with d.capture_output() as captured:
+            d.dump("cap_no_file", torch.randn(3, 3))
+
+        assert "cap_no_file" in captured
+        assert len(_get_filenames(tmp_path)) == 0
+
+    def test_capture_output_multiple(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+
+        with d.capture_output() as captured:
+            d.dump("first", torch.randn(2, 2))
+            d.dump("second", torch.randn(3, 3))
+
+        assert set(captured.keys()) == {"first", "second"}
+        assert captured["first"]["value"].shape == (2, 2)
+        assert captured["second"]["value"].shape == (3, 3)
+
+    def test_capture_output_value_cloned(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.zeros(3, 3)
+
+        with d.capture_output() as captured:
+            d.dump("clone_check", tensor)
+
+        tensor.fill_(999.0)
+        assert torch.equal(captured["clone_check"]["value"], torch.zeros(3, 3))
+
+    def test_capture_output_respects_filter(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="^keep")
+
+        with d.capture_output() as captured:
+            d.dump("keep_this", torch.randn(3, 3))
+            d.dump("skip_this", torch.randn(3, 3))
+
+        assert "keep_this" in captured
+        assert "skip_this" not in captured
 
 
 class TestDumpDictFormat:
@@ -556,6 +688,30 @@ class TestDumpModel:
 
         filenames = _get_filenames(tmp_path)
         assert all("grad" in f for f in filenames)
+
+
+class TestCleanup:
+    def test_cleanup_removes_old_dumps(self, tmp_path):
+        old_dir = tmp_path / "sglang_dump_old"
+        old_dir.mkdir()
+        (old_dir / "dummy.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path, cleanup_previous=True)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert not old_dir.exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
+    def test_no_cleanup_by_default(self, tmp_path):
+        old_dir = tmp_path / "sglang_dump_old"
+        old_dir.mkdir()
+        (old_dir / "dummy.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert old_dir.exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
 
 
 if __name__ == "__main__":

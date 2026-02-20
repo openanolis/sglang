@@ -4,6 +4,7 @@ import re
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -33,6 +34,9 @@ class _Dumper:
     Then run the program:
     `SGLANG_DUMPER_ENABLE=1 python ...`
 
+    Auto-cleanup old dumps before first write:
+    `SGLANG_DUMPER_CLEANUP_PREVIOUS=1 python ...`
+
     Alternatively, disable at startup and enable via HTTP:
     1. `python ...`
     2. `curl -X POST http://localhost:40000/dumper -d '{"enable": true}'`
@@ -46,24 +50,29 @@ class _Dumper:
         enable: bool,
         base_dir: Path,
         filter: Optional[str] = None,
-        enable_write_file: bool = True,
+        enable_output_file: bool = True,
+        enable_output_console: bool = True,
         enable_value: bool = True,
         enable_grad: bool = False,
         enable_model_value: bool = True,
         enable_model_grad: bool = True,
         partial_name: Optional[str] = None,
         enable_http_server: bool = True,
+        cleanup_previous: bool = False,
+        collective_timeout: int = 60,
     ):
         # Config
         self._enable = enable
         # TODO (1) support filtering kv instead of name only (2) allow HTTP req change it
         self._filter = filter
         self._base_dir = base_dir
-        self._enable_write_file = enable_write_file
+        self._enable_output_file = enable_output_file
+        self._enable_output_console = enable_output_console
         self._enable_value = enable_value
         self._enable_grad = enable_grad
         self._enable_model_value = enable_model_value
         self._enable_model_grad = enable_model_grad
+        self._collective_timeout = collective_timeout
 
         # States
         self._partial_name = partial_name
@@ -71,7 +80,9 @@ class _Dumper:
         self._forward_pass_id = 0
         self._global_ctx = {}
         self._override_enable = None
+        self._captured_output_data: Optional[dict] = None
         self._http_server_handled = not enable_http_server
+        self._pending_cleanup = cleanup_previous
 
     @classmethod
     def from_env(cls) -> "_Dumper":
@@ -79,7 +90,8 @@ class _Dumper:
             enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
             base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
             filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
-            enable_write_file=get_bool_env_var("SGLANG_DUMPER_WRITE_FILE", "1"),
+            enable_output_file=get_bool_env_var("SGLANG_DUMPER_OUTPUT_FILE", "1"),
+            enable_output_console=get_bool_env_var("SGLANG_DUMPER_OUTPUT_CONSOLE", "1"),
             enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
             enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
             enable_model_value=get_bool_env_var(
@@ -90,6 +102,8 @@ class _Dumper:
             enable_http_server=get_bool_env_var(
                 "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
             ),
+            cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
+            collective_timeout=60,
         )
 
     def on_forward_pass_start(self):
@@ -113,11 +127,13 @@ class _Dumper:
         if self._http_server_handled:
             return
         self._http_server_handled = True
-        _start_maybe_http_server(self)
+        _start_maybe_http_server(self, timeout_seconds=self._collective_timeout)
 
     def _ensure_partial_name(self):
         if self._partial_name is None:
-            self._partial_name = _get_partial_name()
+            self._partial_name = _get_partial_name(
+                timeout_seconds=self._collective_timeout
+            )
             print(f"[Dumper] Choose partial_name={self._partial_name}")
 
     def set_ctx(self, **kwargs):
@@ -132,6 +148,15 @@ class _Dumper:
         self._global_ctx = {
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
+
+    @contextmanager
+    def capture_output(self):
+        assert self._captured_output_data is None
+        self._captured_output_data = {}
+        try:
+            yield self._captured_output_data
+        finally:
+            self._captured_output_data = None
 
     def override_enable(self, value: bool):
         self._override_enable = value
@@ -283,23 +308,34 @@ class _Dumper:
         full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
 
-        print(
-            f"[{tag}] [{rank}, {time.time()}] {path} "
-            f"type={type(value)} "
-            f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
-            f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
-            f"device={value.device if isinstance(value, torch.Tensor) else None} "
-            f"id={id(value)} "
-            f"sample_value={get_truncated_value(value)}"
-        )
+        if self._enable_output_console:
+            print(
+                f"[{tag}] [{rank}, {time.time()}] {path} "
+                f"type={type(value)} "
+                f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
+                f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
+                f"device={value.device if isinstance(value, torch.Tensor) else None} "
+                f"id={id(value)} "
+                f"sample_value={get_truncated_value(value)}"
+            )
 
-        if self._enable_write_file and save:
-            path.parent.mkdir(parents=True, exist_ok=True)
+        capturing = self._captured_output_data is not None
+        if save and (self._enable_output_file or capturing):
             output_data = {
                 "value": value.data if isinstance(value, torch.nn.Parameter) else value,
                 "meta": dict(**full_kwargs, **self._static_meta),
             }
-            _torch_save(output_data, str(path))
+
+            if capturing:
+                output_data["value"] = _deepcopy_or_clone(output_data["value"])
+                self._captured_output_data[name] = output_data
+            else:
+                if self._pending_cleanup:
+                    self._pending_cleanup = False
+                    _cleanup_old_dumps(self._base_dir)
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _torch_save(output_data, str(path))
 
     @cached_property
     def _static_meta(self) -> dict:
@@ -321,12 +357,51 @@ def _torch_save(value, path: str):
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
 
 
-def _get_partial_name():
+def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60):
+    completed = threading.Event()
+
+    def watchdog():
+        if not completed.wait(timeout=timeout_seconds):
+            print(
+                f"\n[Dumper] WARNING: '{operation_name}' has not completed after "
+                f"{timeout_seconds}s. This usually means not all ranks are "
+                f"participating in this collective operation.\n",
+                flush=True,
+            )
+
+    thread = threading.Thread(target=watchdog, daemon=True)
+    thread.start()
+    try:
+        return fn()
+    finally:
+        completed.set()
+
+
+def _get_partial_name(timeout_seconds: int = 60):
     rank = _get_rank()
     object_list = [str(time.time()) if rank == 0 else None]
+
     if dist.is_initialized():
-        dist.broadcast_object_list(object_list, device="cuda")
+        _collective_with_timeout(
+            lambda: dist.broadcast_object_list(object_list, device="cuda"),
+            operation_name="broadcast_object_list in _get_partial_name",
+            timeout_seconds=timeout_seconds,
+        )
+
     return object_list[0]
+
+
+def _cleanup_old_dumps(base_dir: Path) -> None:
+    import shutil
+
+    if _get_rank() == 0:
+        for entry in base_dir.glob("sglang_dump_*"):
+            if entry.is_dir():
+                shutil.rmtree(entry)
+                print(f"[Dumper] Cleaned up {entry}")
+
+    if dist.is_initialized():
+        dist.barrier()
 
 
 def _get_rank():
@@ -364,6 +439,12 @@ def _materialize_value(value):
     if callable(value):
         value = value()
     return value
+
+
+def _deepcopy_or_clone(x):
+    if isinstance(x, torch.Tensor):
+        return x.clone()
+    return deepcopy(x)
 
 
 # -------------------------------------- static meta ------------------------------------------
@@ -471,14 +552,16 @@ def _collect_megatron_parallel_info():
 # -------------------------------------- http control server ------------------------------------------
 
 
-def _start_maybe_http_server(dumper):
+def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     http_port = get_int_env_var("SGLANG_DUMPER_SERVER_PORT", 40000)
     zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
     if http_port <= 0:
         return
 
     local_handler = _DumperRpcHandler(dumper)
-    rpc_handles = _create_zmq_rpc_handles(local_handler, base_port=zmq_base_port)
+    rpc_handles = _create_zmq_rpc_handles(
+        local_handler, base_port=zmq_base_port, timeout_seconds=timeout_seconds
+    )
 
     if _get_rank() == 0:
         handler_class = _make_dumper_http_handler(rpc_handles=rpc_handles)
@@ -526,7 +609,9 @@ class _DumperRpcHandler:
 # -------------------------------------- zmq rpc ------------------------------------------
 
 
-def _create_zmq_rpc_handles(handler, base_port: int) -> Optional[List["_ZmqRpcHandle"]]:
+def _create_zmq_rpc_handles(
+    handler, base_port: int, timeout_seconds: int = 60
+) -> Optional[List["_ZmqRpcHandle"]]:
     import zmq
 
     rank = _get_rank()
@@ -555,7 +640,11 @@ def _create_zmq_rpc_handles(handler, base_port: int) -> Optional[List["_ZmqRpcHa
 
     if dist.is_initialized():
         all_addresses = [None] * world_size
-        dist.all_gather_object(all_addresses, local_addr)
+        _collective_with_timeout(
+            lambda: dist.all_gather_object(all_addresses, local_addr),
+            operation_name="all_gather_object in _create_zmq_rpc_handles",
+            timeout_seconds=timeout_seconds,
+        )
     else:
         all_addresses = [local_addr]
     print(f"[Dumper.ZmqRpc] rank={rank} all_addresses={all_addresses}")
