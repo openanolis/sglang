@@ -102,6 +102,7 @@ class _DumperConfig(_FrozenConfig):
     cleanup_previous: bool = False
     collective_timeout: int = 60
     server_port: str = "-1"
+    non_intrusive_mode: str = "core"
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -230,6 +231,15 @@ class _Dumper:
         self._global_ctx = {
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
+
+    def register_non_intrusive_dumper(
+        self,
+        model: "torch.nn.Module",
+    ) -> Optional["_NonIntrusiveDumper"]:
+        mode = self._config.non_intrusive_mode
+        if mode == "off":
+            return None
+        return _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
 
     # ------------------------------- public :: secondary ---------------------------------
 
@@ -463,6 +473,120 @@ class _Dumper:
             name = _get_partial_name(timeout_seconds=self._config.collective_timeout)
             self.configure(partial_name=name)
             print(f"[Dumper] Choose partial_name={name}")
+
+
+# -------------------------------------- hook dumper ------------------------------------------
+
+
+class _NonIntrusiveDumper:
+    _NAME_PREFIX = "non_intrusive__"
+    _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
+    _LAYER_NAME_RE = re.compile(r"(?:.+\.)?layers\.(\d+)$")
+
+    def __init__(
+        self,
+        dumper: _Dumper,
+        model: "torch.nn.Module",
+        mode: str,
+    ):
+        self._dumper = dumper
+        self._mode = mode
+
+        for module_name, module in model.named_modules():
+            if ctx := self._detect_module_ctx(module_name, module):
+                self._register_ctx_hooks(module, ctx=ctx)
+
+            module.register_forward_hook(
+                self._make_forward_hook(
+                    module_name=module_name,
+                    is_root=(module_name == ""),
+                )
+            )
+
+    @classmethod
+    def _detect_module_ctx(
+        cls, module_name: str, module: "torch.nn.Module"
+    ) -> Optional[dict]:
+        if cls._LAYER_NAME_RE.fullmatch(module_name):
+            # Megatron
+            if hasattr(module, "layer_number"):
+                return {"layer_id": module.layer_number - 1}
+            # SGLang
+            if hasattr(module, "layer_id"):
+                return {"layer_id": module.layer_id}
+        return None
+
+    def _register_ctx_hooks(self, module: "torch.nn.Module", *, ctx: dict) -> None:
+        clear_ctx = {k: None for k in ctx}
+        module.register_forward_pre_hook(
+            lambda _mod, _input, _ctx=ctx: self._dumper.set_ctx(**_ctx)
+        )
+        module.register_forward_hook(
+            lambda _mod, _input, _output, _clear=clear_ctx: self._dumper.set_ctx(
+                **_clear
+            )
+        )
+
+    def _make_forward_hook(self, *, module_name: str, is_root: bool):
+        def _hook(_module, input, output):
+            for i, item in enumerate(input):
+                self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
+
+            if output is not None:
+                self._dump_value(module_name, output, role="output", is_root=False)
+
+        return _hook
+
+    def _dump_value(self, module_name: str, value, role: str, *, is_root: bool) -> None:
+        for key, tensor in self._convert_value(
+            value, skip_forward_batch=(not is_root)
+        ).items():
+            if key in self._CORE_FIELDS:
+                self._dumper.dump(key, tensor)
+            elif self._mode == "all":
+                parts = [p for p in (module_name, role, key) if p]
+                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
+
+    @staticmethod
+    def _convert_value(
+        value, *, skip_forward_batch: bool = False
+    ) -> dict[str, torch.Tensor]:
+        if isinstance(value, torch.Tensor):
+            return {"": value}
+
+        if isinstance(value, (tuple, list)):
+            tensors = [t for t in value if isinstance(t, torch.Tensor)]
+            if len(tensors) == 1:
+                return {"": tensors[0]}
+            return {str(i): t for i, t in enumerate(tensors)}
+
+        # SGLang specific
+        try:
+            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                PPProxyTensors,
+            )
+
+            if isinstance(value, LogitsProcessorOutput):
+                return {"next_token_logits": value.next_token_logits}
+            if isinstance(value, ForwardBatch):
+                if skip_forward_batch:
+                    return {}
+                return {
+                    "input_ids": value.input_ids,
+                    "seq_lens": value.seq_lens,
+                    "positions": value.positions,
+                }
+            if isinstance(value, PPProxyTensors):
+                return {k: v for k, v in value.tensors.items()}
+        except ImportError:
+            pass
+
+        # Megatron specific
+        # TODO
+
+        return {}
 
 
 # -------------------------------------- util fn ------------------------------------------
