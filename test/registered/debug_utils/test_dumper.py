@@ -13,14 +13,14 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
-    _collect_megatron_parallel_info,
-    _collect_sglang_parallel_info,
     _collective_with_timeout,
     _Dumper,
     _DumperConfig,
     _format_tags,
     _materialize_value,
+    _MegatronPlugin,
     _obj_to_dict,
+    _SGLangPlugin,
     _torch_save,
     dumper,
     get_tensor_info,
@@ -440,7 +440,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
     config = _DumperConfig(
         enable=True,
         dir=str(tmp_path),
-        partial_name="test",
+        exp_name="test",
         enable_http_server=False,
         **overrides,
     )
@@ -448,7 +448,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
 
 
 def _get_filenames(tmpdir):
-    return {f.name for f in Path(tmpdir).glob("sglang_dump_*/*.pt")}
+    return {f.name for f in Path(tmpdir).glob("*/*.pt")}
 
 
 def _assert_files(filenames, *, exist=(), not_exist=()):
@@ -468,7 +468,7 @@ def _load_dump(path: Path) -> dict:
 def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
     matches = [
         f
-        for f in Path(tmpdir).glob("sglang_dump_*/*.pt")
+        for f in Path(tmpdir).glob("*/*.pt")
         if f"rank={rank}" in f.name and name in f.name
     ]
     assert (
@@ -529,10 +529,10 @@ class TestStaticMetadata:
         assert meta1 is meta2
 
     def test_parallel_info_graceful_fallback(self):
-        sglang_info = _collect_sglang_parallel_info()
+        sglang_info = _SGLangPlugin().collect_parallel_info()
         assert isinstance(sglang_info, dict)
 
-        megatron_info = _collect_megatron_parallel_info()
+        megatron_info = _MegatronPlugin().collect_parallel_info()
         assert isinstance(megatron_info, dict)
 
     def test_dump_includes_static_meta(self, tmp_path):
@@ -770,7 +770,7 @@ class TestDumpModel:
 
 class TestCleanup:
     def test_cleanup_removes_old_dumps(self, tmp_path):
-        old_dir = tmp_path / "sglang_dump_old"
+        old_dir = tmp_path / "dump_old"
         old_dir.mkdir()
         (old_dir / "dummy.pt").touch()
 
@@ -781,7 +781,7 @@ class TestCleanup:
         _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
 
     def test_no_cleanup_by_default(self, tmp_path):
-        old_dir = tmp_path / "sglang_dump_old"
+        old_dir = tmp_path / "dump_old"
         old_dir.mkdir()
         (old_dir / "dummy.pt").touch()
 
@@ -1019,6 +1019,43 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
         )
         P = self._PREFIX
         assert torch.allclose(captured[f"{P}output"]["value"], output)
+
+    def test_inputs_dumped_before_forward(self, tmp_path):
+        """Inputs are captured *before* forward(); in-place mutation must not affect them."""
+
+        class Mutator(torch.nn.Module):
+            def forward(self, x):
+                x.fill_(999.0)
+                return x
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mutator = Mutator()
+
+            def forward(self, x):
+                return self.mutator(x)
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        original_x = x.clone()
+        with d.capture_output() as captured:
+            model(x)
+
+        P = self._PREFIX
+        dumped_input = captured[f"{P}model.mutator.inputs.0"]["value"]
+        assert torch.allclose(dumped_input, original_x), (
+            f"pre-hook should capture inputs before forward mutates them; "
+            f"got {dumped_input} but expected {original_x}"
+        )
+
+        dumped_output = captured[f"{P}model.mutator.output"]["value"]
+        assert (
+            dumped_output == 999.0
+        ).all(), "post-hook should capture outputs after forward"
 
     def test_hooks_all_module_levels(self, tmp_path):
         class Attention(torch.nn.Module):
