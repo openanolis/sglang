@@ -52,8 +52,7 @@ def _normalize_embedding_ports(embedding_port):
 
 def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
     import grpc
-
-    from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
@@ -73,8 +72,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
 
 def _grpc_encode_request(target, encode_request):
     import grpc
-
-    from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
@@ -100,8 +98,7 @@ def _grpc_encode_request(target, encode_request):
 
 def _grpc_send_request(target, request_json):
     import grpc
-
-    from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
@@ -859,10 +856,6 @@ class MMReceiverHTTP(MMReceiverBase):
                 offset += embedding_size_list_sort[idx]
             await asyncio.gather(*metadata_tasks)
 
-    # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
-        return await super().recv_mm_data(img_data, mm_processor, prompt)
-
 
 class MMReceiverGrpc(MMReceiverBase):
     def __init__(
@@ -1003,26 +996,25 @@ class MMReceiverGrpc(MMReceiverBase):
         if grpc_metadata_tasks:
             await asyncio.gather(*grpc_metadata_tasks)
 
-    # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
-        return await super().recv_mm_data(img_data, mm_processor, prompt)
-
 
 def _validate_transport_mode(transport_mode: str, encoder_urls):
     if transport_mode == "grpc":
-        if any(url.startswith("http://") for url in encoder_urls):
-            raise ValueError(
-                "EPD MMReceiver: grpc mode requires grpc:// encoder URLs. "
-                "Use grpc:// encoder URLs or set "
-                "SGLANG_ENCODER_MM_RECEIVER_MODE=http for the prefill process."
-            )
+        invalid_prefix = "http://"
+        error_msg = (
+            "EPD MMReceiver: grpc mode requires grpc:// encoder URLs. "
+            "Set SGLANG_ENCODER_MM_RECEIVER_MODE=http for http:// URLs."
+        )
     elif transport_mode == "http":
-        if any(url.startswith("grpc://") for url in encoder_urls):
-            raise ValueError(
-                "EPD MMReceiver: http mode requires http:// encoder URLs. "
-                "Use http:// encoder URLs or set "
-                "SGLANG_ENCODER_MM_RECEIVER_MODE=grpc for the prefill process."
-            )
+        invalid_prefix = "grpc://"
+        error_msg = (
+            "EPD MMReceiver: http mode requires http:// encoder URLs. "
+            "Set SGLANG_ENCODER_MM_RECEIVER_MODE=grpc for grpc:// URLs."
+        )
+    else:
+        return
+
+    if any(url.startswith(invalid_prefix) for url in encoder_urls):
+        raise ValueError(error_msg)
 
 
 _MM_RECEIVER_BY_MODE = {
