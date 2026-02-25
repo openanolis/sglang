@@ -55,7 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,8 @@ class LogitsProcessorOutput:
     # The logprobs of input tokens.        shape: [#token]
     input_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: List = None
-    input_top_logprobs_idx: List = None
+    input_top_logprobs_val: Optional[List] = None
+    input_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -247,6 +247,7 @@ class LogitsProcessor(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
@@ -375,7 +376,7 @@ class LogitsProcessor(nn.Module):
 
             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:
-            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
+            logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
                 pruned_states,
                 sample_indices,
                 input_logprob_indices,
@@ -906,23 +907,23 @@ class LogitsProcessor(nn.Module):
         return hidden_states, hidden_states
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.config.vocab_size % self.attn_tp_size == 0:
+        if self.vocab_size % self.attn_tp_size == 0:
             global_logits = torch.empty(
                 (
                     self.attn_tp_size,
                     logits.shape[0],
-                    self.config.vocab_size // self.attn_tp_size,
+                    self.vocab_size // self.attn_tp_size,
                 ),
                 device=logits.device,
                 dtype=logits.dtype,
             )
             attn_tp_all_gather_into_tensor(global_logits, logits)
             global_logits = global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.config.vocab_size
+                logits.shape[0], self.vocab_size
             )
         else:
             global_logits = torch.empty(
-                (self.config.vocab_size, logits.shape[0]),
+                (self.vocab_size, logits.shape[0]),
                 device=logits.device,
                 dtype=logits.dtype,
             )
@@ -955,10 +956,10 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.config.vocab_size])
+            logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:
-            logits = logits[:, : self.config.vocab_size].float()
+            logits = logits[:, : self.vocab_size].float()
         return logits
 
     def _get_dllm_logits(
