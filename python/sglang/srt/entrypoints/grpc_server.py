@@ -164,10 +164,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+            from sglang.srt.disaggregation import encode_receiver as mm_receiver
 
-            os.environ.setdefault("SGLANG_ENCODER_MM_RECEIVER_MODE", "grpc")
-            self.mm_receiver = create_mm_receiver(self.server_args)
+            self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -255,19 +254,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         logger.info(f"Receive embedding request: {request.request_id}")
 
         try:
-            # Convert request
             tokenized_req = self._convert_embed_request(request)
 
-            # Submit to request manager
             future = await self.request_manager.embedding_request(
                 obj=tokenized_req,
                 request_id=request.request_id,
             )
 
-            # Wait for result
             result = await future
 
-            # Create response
             return sglang_scheduler_pb2.EmbedResponse(
                 request_id=request.request_id,
                 complete=sglang_scheduler_pb2.EmbedComplete(
