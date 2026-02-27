@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from sglang.srt.debug_utils.comparator.aligner.axis_swapper import (
+    AxisSwapperPlan,
+    compute_axis_swapper_plan,
+)
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPerStepSubPlan,
@@ -19,7 +23,11 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
 from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
     compute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.dims import parse_dims
+from sglang.srt.debug_utils.comparator.dims import (
+    TOKEN_DIM_NAME,
+    find_dim_index,
+    parse_dims,
+)
 from sglang.srt.debug_utils.comparator.utils import Pair
 
 
@@ -28,12 +36,37 @@ def compute_aligner_plan(
     metas_pair: Pair[list[dict[str, Any]]],
     token_aligner_plan: Optional[TokenAlignerPlan],
 ) -> AlignerPlan:
+    dims_str_pair: Pair[Optional[str]] = metas_pair.map(
+        lambda metas: metas[0].get("dims") if metas else None
+    )
+    axis_swapper_plan: Optional[AxisSwapperPlan] = compute_axis_swapper_plan(
+        dims_str_pair=dims_str_pair
+    )
+
     return AlignerPlan(
         per_step_plans=metas_pair.map(
             lambda metas: _compute_per_step_plans(metas=metas)
         ),
         token_aligner_plan=token_aligner_plan,
+        axis_swapper_plan=axis_swapper_plan,
     )
+
+
+def _compute_token_dim(metas: list[dict[str, Any]]) -> int:
+    fallback_dim = 0
+
+    if not metas:
+        return fallback_dim
+
+    dims_str: Optional[str] = metas[0].get("dims")
+    if dims_str is None:
+        return fallback_dim
+
+    idx: Optional[int] = find_dim_index(parse_dims(dims_str), TOKEN_DIM_NAME)
+    if idx is None:
+        return fallback_dim
+
+    return idx
 
 
 def _compute_per_step_plans(metas: list[dict[str, Any]]) -> list[AlignerPerStepPlan]:

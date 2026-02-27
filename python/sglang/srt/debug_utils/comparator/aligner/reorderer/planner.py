@@ -3,9 +3,14 @@ from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
     ZigzagToNaturalParams,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
-from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering, ParallelAxis
+from sglang.srt.debug_utils.comparator.dims import (
+    SEQ_DIM_NAME,
+    DimSpec,
+    Ordering,
+    ParallelAxis,
+)
 
-_ALLOWED_ZIGZAG_DIM_NAMES: set[str] = {"s"}
+_ALLOWED_ZIGZAG_DIM_NAMES: set[str] = {SEQ_DIM_NAME}
 
 
 def compute_reorderer_plans(
@@ -14,7 +19,7 @@ def compute_reorderer_plans(
 ) -> list[ReordererPlan]:
     plans: list[ReordererPlan] = []
 
-    for dim_index, spec in enumerate(dim_specs):
+    for spec in dim_specs:
         if (
             spec.ordering is not None
             and spec.ordering != Ordering.NATURAL
@@ -32,7 +37,7 @@ def compute_reorderer_plans(
             axis_size: int = parallel_infos[0][spec.parallel].axis_size
             plans.append(
                 ReordererPlan(
-                    params=ZigzagToNaturalParams(dim=dim_index, cp_size=axis_size),
+                    params=ZigzagToNaturalParams(dim_name=spec.name, cp_size=axis_size),
                 )
             )
 

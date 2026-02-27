@@ -11,6 +11,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenLocator,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     GeneralWarning,
@@ -120,6 +121,7 @@ class TestTokenAlignerPlan:
                 x=TokenLocator(steps=[0, 0, 1], token_index_in_step=[0, 1, 0]),
                 y=TokenLocator(steps=[0, 1, 1], token_index_in_step=[0, 0, 1]),
             ),
+            layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
         )
         assert len(plan.locators.x.steps) == 3
 
@@ -130,6 +132,7 @@ class TestTokenAlignerPlan:
                     x=TokenLocator(steps=[0, 0], token_index_in_step=[0, 1]),
                     y=TokenLocator(steps=[0, 1, 1], token_index_in_step=[0, 0, 1]),
                 ),
+                layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
             )
 
 
@@ -185,6 +188,7 @@ def _make_diff_info(*, passed: bool) -> DiffInfo:
         max_diff_coord=[0, 0],
         baseline_at_max=1.0,
         target_at_max=1.01,
+        diff_threshold=1e-3,
         passed=passed,
     )
 

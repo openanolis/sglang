@@ -10,14 +10,9 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     SGLangSeqId,
     TokenAlignerStepAux,
 )
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
-
-_BSHD_NOT_SUPPORTED_MSG: str = (
-    "BSHD layout is not currently supported. "
-    "Use aux_loader BSHD→THD conversion (planned)."
-)
-
 
 # ── plugin ABC ─────────────────────────────────────────────────────
 
@@ -45,11 +40,11 @@ class _AuxFrameworkPlugin(ABC):
         return frozenset()
 
     @abstractmethod
-    def detect_layout(self, raw: dict[int, dict[str, object]]) -> str: ...
+    def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout: ...
 
     @abstractmethod
     def compute_step_aux(
-        self, step_data: dict[str, object], *, layout: str, step: int
+        self, step_data: dict[str, object], *, layout: TokenLayout, step: int
     ) -> TokenAlignerStepAux: ...
 
     @abstractmethod
@@ -89,11 +84,11 @@ class _SGLangPlugin(_AuxFrameworkPlugin):
     def has_required_names(self, names: set[str]) -> bool:
         return "input_ids" in names and "seq_lens" in names
 
-    def detect_layout(self, raw: dict[int, dict[str, object]]) -> str:
-        return "thd"
+    def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout:
+        return TokenLayout.T
 
     def compute_step_aux(
-        self, step_data: dict[str, object], *, layout: str, step: int
+        self, step_data: dict[str, object], *, layout: TokenLayout, step: int
     ) -> TokenAlignerStepAux:
         input_ids = step_data["input_ids"]
         positions = step_data["positions"]
@@ -152,47 +147,56 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
         return frozenset({"cu_seqlens_q", "cu_seqlens_kv", "qkv_format"})
 
     def has_required_names(self, names: set[str]) -> bool:
-        return "input_ids" in names and "cu_seqlens_q" in names
+        return "input_ids" in names
 
-    def detect_layout(self, raw: dict[int, dict[str, object]]) -> str:
+    def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout:
         for step_data in raw.values():
             if (qkv_format := step_data.get("qkv_format")) is not None:
                 fmt = qkv_format if isinstance(qkv_format, str) else str(qkv_format)
                 if "bshd" in fmt.lower():
-                    raise NotImplementedError(_BSHD_NOT_SUPPORTED_MSG)
-                return "thd"
+                    return TokenLayout.BS
+                return TokenLayout.T
 
             input_ids = step_data.get("input_ids")
             if isinstance(input_ids, torch.Tensor) and input_ids.ndim == 2:
-                raise NotImplementedError(_BSHD_NOT_SUPPORTED_MSG)
+                return TokenLayout.BS
 
         warning_sink.add(
             GeneralWarning(
                 category="layout_detection_fallback",
                 message=(
                     "Megatron layout detection: no qkv_format or 2D input_ids found, "
-                    "falling back to thd"
+                    "falling back to T"
                 ),
             )
         )
-        return "thd"
+        return TokenLayout.T
 
     def compute_step_aux(
-        self, step_data: dict[str, object], *, layout: str, step: int
+        self, step_data: dict[str, object], *, layout: TokenLayout, step: int
     ) -> TokenAlignerStepAux:
         input_ids: torch.Tensor = step_data["input_ids"]
+        is_bshd: bool = layout == TokenLayout.BS
+
+        # BSHD [B, S] → flat [B*S]; THD [T] stays as-is
+        flat_ids: list[int] = input_ids.reshape(-1).tolist()
 
         if (cu_seqlens_q := step_data.get("cu_seqlens_q")) is not None:
-            seq_lens: torch.Tensor = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            seq_lens_list: list[int] = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+        elif is_bshd:
+            seq_lens_list = [input_ids.shape[1]] * input_ids.shape[0]
         else:
-            seq_lens = torch.tensor([input_ids.shape[0]], dtype=torch.long)
+            seq_lens_list = [input_ids.shape[0]]
 
         if (position_ids := step_data.get("position_ids")) is not None:
-            positions: torch.Tensor = position_ids
+            flat_positions: list[int] = position_ids.reshape(-1).tolist()
+        elif is_bshd:
+            flat_positions = list(range(input_ids.shape[1])) * input_ids.shape[0]
         else:
-            positions = _infer_positions(seq_lens=seq_lens)
+            flat_positions = _infer_positions(
+                seq_lens=torch.tensor(seq_lens_list)
+            ).tolist()
 
-        seq_lens_list: list[int] = seq_lens.tolist()
         num_seqs: int = len(seq_lens_list)
         seq_ids: list[SeqId] = [
             PositionalSeqId(step=step, seq_index=seq_index)
@@ -200,8 +204,8 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
         ]
 
         return TokenAlignerStepAux(
-            input_ids=input_ids.tolist(),
-            positions=positions.tolist(),
+            input_ids=flat_ids,
+            positions=flat_positions,
             seq_lens=seq_lens_list,
             seq_ids=seq_ids,
         )
