@@ -20,23 +20,19 @@ def run_server(server_args):
             )
 
             asyncio.run(serve_grpc_encoder(server_args))
-            return
+        else:
+            from sglang.srt.disaggregation.encode_server import launch_server
 
-        from sglang.srt.disaggregation.encode_server import launch_server
-
-        launch_server(server_args)
-        return
-
-    if server_args.grpc_mode:
+            launch_server(server_args)
+    elif server_args.grpc_mode:
         from sglang.srt.entrypoints.grpc_server import serve_grpc
 
         asyncio.run(serve_grpc(server_args))
-        return
+    else:
+        # Default mode: HTTP mode.
+        from sglang.srt.entrypoints.http_server import launch_server
 
-    # Default mode: HTTP mode.
-    from sglang.srt.entrypoints.http_server import launch_server
-
-    launch_server(server_args)
+        launch_server(server_args)
 
 
 if __name__ == "__main__":
