@@ -1,3 +1,4 @@
+import enum
 import functools
 import json
 import os
@@ -138,6 +139,7 @@ class DumperConfig(_BaseConfig):
     collective_timeout: int = 60
     server_port: str = "-1"
     non_intrusive_mode: str = "core"
+    source_patcher_config: Optional[str] = None
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -325,6 +327,25 @@ class _Dumper:
 
         return decorator
 
+    def apply_source_patches(self) -> None:
+        """Apply source patches from DUMPER_SOURCE_PATCHER_CONFIG if set.
+
+        Automatically injects ``from sglang.srt.debug_utils.dumper import dumper``
+        into every replacement block so users don't need to write it in YAML.
+        """
+        config_path = self._config.source_patcher_config
+        if not config_path:
+            return
+
+        from sglang.srt.debug_utils.source_patcher import apply_patches_from_config
+
+        yaml_content: str = Path(config_path).read_text()
+        print(f"[source_patcher] loading config from {config_path}")
+        apply_patches_from_config(
+            yaml_content,
+            extra_imports=["from sglang.srt.debug_utils.dumper import dumper"],
+        )
+
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
@@ -395,7 +416,14 @@ class _Dumper:
         if not self._config.enable:
             return
 
-        tags = dict(name=name, **extra_kwargs, **self._state.global_ctx)
+        recompute_status = _detect_recompute_status()
+        tags = dict(
+            name=name,
+            recompute_status=recompute_status.value,
+            **extra_kwargs,
+            **self._state.global_ctx,
+        )
+
         if (f := self._config.filter) is not None and re.search(
             f, _format_tags(tags)
         ) is None:
@@ -404,6 +432,7 @@ class _Dumper:
         if not (enable_value or enable_curr_grad or enable_future_grad):
             return
 
+        recompute_meta = recompute_status.to_pseudo_parallel_meta()
         value = _materialize_value(value)
 
         if enable_value:
@@ -412,7 +441,7 @@ class _Dumper:
                 tags=tags,
                 value=value,
                 save=save,
-                meta_only_fields=value_meta_only_fields or {},
+                meta_only_fields={**(value_meta_only_fields or {}), **recompute_meta},
             )
 
         if (
@@ -425,7 +454,7 @@ class _Dumper:
                 tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
-                meta_only_fields=grad_meta_only_fields or {},
+                meta_only_fields={**(grad_meta_only_fields or {}), **recompute_meta},
             )
 
         if enable_future_grad:
@@ -452,7 +481,10 @@ class _Dumper:
             return
 
         captured_step = self._state.step
-        captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
+        captured_tags = dict(
+            name=f"grad__{name}",
+            **deepcopy(extra_kwargs),
+        )
         captured_meta_only = meta_only_fields or {}
 
         def grad_hook(grad: torch.Tensor) -> None:
@@ -588,11 +620,13 @@ class _NonIntrusiveDumper:
     def _detect_module_ctx(
         cls, module_name: str, module: "torch.nn.Module"
     ) -> Optional[dict]:
-        if cls._LAYER_NAME_RE.fullmatch(module_name):
+        match = cls._LAYER_NAME_RE.fullmatch(module_name)
+        if match:
             for plugin in _plugins:
                 layer_id = plugin.detect_layer_id(module)
                 if layer_id is not None:
                     return {"layer_id": layer_id}
+            return {"layer_id": int(match.group(1))}
         return None
 
     def _register_ctx_hooks(self, module: "torch.nn.Module", *, ctx: dict) -> None:
@@ -1120,6 +1154,20 @@ def _get_local_ip_by_remote() -> Optional[str]:
 # -------------------------------------- framework plugins ------------------------------------------
 
 
+class _RecomputeStatus(enum.Enum):
+    DISABLED = "disabled"
+    ORIGINAL = "original"  # inside checkpoint, original forward
+    RECOMPUTE = "recompute"  # inside checkpoint, recompute forward
+
+    def to_pseudo_parallel_meta(self) -> dict[str, Any]:
+        if self == _RecomputeStatus.DISABLED:
+            return {}
+        return {
+            "recompute_pseudo_rank": 1 if self == _RecomputeStatus.RECOMPUTE else 0,
+            "recompute_pseudo_size": 2,
+        }
+
+
 class _FrameworkPlugin(ABC):
     @property
     @abstractmethod
@@ -1145,6 +1193,9 @@ class _FrameworkPlugin(ABC):
 
     def get_tokenizer_path(self) -> Optional[str]:
         return None
+
+    def detect_recompute_status(self) -> _RecomputeStatus:
+        return _RecomputeStatus.DISABLED
 
 
 class _SGLangPlugin(_FrameworkPlugin):
@@ -1331,8 +1382,30 @@ class _MegatronPlugin(_FrameworkPlugin):
             {"input_ids", "position_ids", "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
         )
 
+    def detect_recompute_status(self) -> _RecomputeStatus:
+        if not self._available:
+            return _RecomputeStatus.DISABLED
+        try:
+            from megatron.core.tensor_parallel.random import is_checkpointing
+
+            if not is_checkpointing():
+                return _RecomputeStatus.DISABLED
+            if torch.is_grad_enabled():
+                return _RecomputeStatus.RECOMPUTE
+            return _RecomputeStatus.ORIGINAL
+        except (ImportError, AttributeError):
+            return _RecomputeStatus.DISABLED
+
 
 _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
+
+
+def _detect_recompute_status() -> _RecomputeStatus:
+    for plugin in _plugins:
+        info = plugin.detect_recompute_status()
+        if info != _RecomputeStatus.DISABLED:
+            return info
+    return _RecomputeStatus.DISABLED
 
 
 # -------------------------------------- singleton ------------------------------------------

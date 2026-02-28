@@ -13,13 +13,14 @@ from sglang.srt.debug_utils.comparator.output_types import (
     ConfigRecord,
     GeneralWarning,
     NonTensorRecord,
+    ReplicatedMismatchWarning,
     SkipRecord,
     SummaryRecord,
     WarningRecord,
     _OutputRecord,
     parse_record_json,
 )
-from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
+from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper, _RecomputeStatus
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="default", nightly=True)
@@ -881,6 +882,68 @@ class TestEntrypointGroupingLogical:
         comp = _assert_single_comparison_passed(records)
         assert comp.name == "hidden"
 
+    def test_recompute_pseudo_replicated_verification(self, tmp_path, capsys):
+        """Recompute pseudo-axis with identical original/recompute tensors → passed."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir in [baseline_dir, target_dir]:
+            _create_recompute_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                original_tensor=tensor,
+                recompute_tensor=tensor.clone(),
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_recompute_pseudo_mismatch_warning(self, tmp_path, capsys):
+        """Recompute pseudo-axis with differing original/recompute → ReplicatedMismatchWarning."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 8)
+        mismatched_tensor = tensor + torch.randn(4, 8) * 10.0
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir in [baseline_dir, target_dir]:
+            _create_recompute_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                original_tensor=tensor,
+                recompute_tensor=mismatched_tensor,
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+
+        recompute_warnings = [
+            w
+            for w in comparisons[0].warnings
+            if isinstance(w, ReplicatedMismatchWarning) and w.axis == "recompute_pseudo"
+        ]
+        assert len(recompute_warnings) > 0
+
 
 class TestEntrypointAxisSwapper:
     """Test cross-framework dim reordering through the full entrypoint pipeline."""
@@ -1441,6 +1504,52 @@ class TestEntrypointNonTensorValues:
         assert roundtripped.values_equal is True
 
 
+# ───────────────────── Visualization integration tests ─────────────────────
+
+
+class TestEntrypointVisualize:
+    """Test --visualize-bundle-details integration."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_if_no_matplotlib(self) -> None:
+        pytest.importorskip("matplotlib")
+
+    def test_visualize_creates_pngs(self, tmp_path, capsys):
+        """--visualize-bundle-details with --filter produces PNG files."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
+        viz_dir = tmp_path / "viz_out"
+        args = _make_args(
+            baseline_path,
+            target_path,
+            grouping="raw",
+            filter="tensor_a",
+            viz_bundle_details=True,
+            viz_output_dir=str(viz_dir),
+        )
+
+        records = _run_and_parse(args, capsys)
+        assert len(_get_comparisons(records)) == 1
+
+        png_files = list(viz_dir.glob("*.png"))
+        assert len(png_files) == 1
+        assert png_files[0].stat().st_size > 0
+
+    def test_no_visualize_no_png(self, tmp_path, capsys):
+        """Without --visualize-bundle-details, no PNGs are created."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        viz_dir = tmp_path / "viz_out"
+        args = _make_args(
+            baseline_path,
+            target_path,
+            grouping="raw",
+            viz_bundle_details=False,
+            viz_output_dir=str(viz_dir),
+        )
+
+        _run_and_parse(args, capsys)
+        assert not viz_dir.exists() or len(list(viz_dir.glob("*.png"))) == 0
+
+
 # --------------------------- Assertion helpers -------------------
 
 
@@ -1565,6 +1674,8 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         filter=None,
         output_format="json",
         grouping="logical",
+        viz_bundle_details=False,
+        viz_output_dir="/tmp/comparator_viz/",
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -1823,6 +1934,53 @@ def _create_tp_sharded_dumps(
             parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
             num_steps=num_steps,
         )
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_recompute_rank_dump(
+    directory: Path,
+    *,
+    rank: int,
+    name: str,
+    original_tensor: torch.Tensor,
+    recompute_tensor: torch.Tensor,
+    dims: str = "h d",
+) -> Path:
+    """Create a dump with both original and recompute forward passes via monkeypatched dumper.
+
+    The dumper naturally produces recompute_pseudo_rank=0 for original and =1 for recompute,
+    plus recompute_pseudo_size=2.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_dumper_module, "_get_rank", lambda: rank)
+
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(directory),
+                exp_name=_FIXED_EXP_NAME,
+            )
+        )
+        dumper.__dict__["_static_meta"] = {"world_rank": rank, "world_size": 1}
+
+        # dump original forward
+        mp.setattr(
+            _dumper_module,
+            "_detect_recompute_status",
+            lambda: _RecomputeStatus.ORIGINAL,
+        )
+        dumper.dump(name, original_tensor, dims=dims)
+
+        # dump recompute forward
+        mp.setattr(
+            _dumper_module,
+            "_detect_recompute_status",
+            lambda: _RecomputeStatus.RECOMPUTE,
+        )
+        dumper.dump(name, recompute_tensor, dims=dims)
+
+        dumper.step()
+
     return directory / _FIXED_EXP_NAME
 
 

@@ -506,6 +506,24 @@ class TestVerifyReplicatedGroup:
         assert len(warnings) == 1
         assert warnings[0].differing_index == 1
 
+    def test_recompute_pseudo_mismatch_warns(self) -> None:
+        """_verify_replicated_group produces warning for RECOMPUTE_PSEUDO axis mismatch."""
+        tensor_a = torch.ones(4)
+        tensor_b = torch.ones(4) + 0.1
+
+        with warning_sink.context() as warnings:
+            _verify_replicated_group(
+                [tensor_a, tensor_b],
+                axis=ParallelAxis.RECOMPUTE_PSEUDO,
+                group_index=0,
+            )
+        assert len(warnings) == 1
+        assert warnings[0].axis == "recompute_pseudo"
+        assert warnings[0].group_index == 0
+        assert warnings[0].differing_index == 1
+        assert warnings[0].baseline_index == 0
+        assert warnings[0].max_abs_diff == pytest.approx(0.1, abs=1e-5)
+
 
 class TestThdCpConcat:
     def test_single_seq(self) -> None:
