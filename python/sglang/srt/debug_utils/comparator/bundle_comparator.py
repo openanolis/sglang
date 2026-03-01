@@ -15,13 +15,17 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.planner import (
     compute_aligner_plan,
 )
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
 )
 from sglang.srt.debug_utils.comparator.dims import (
+    SEQ_DIM_NAME,
+    TOKEN_DIM_NAME,
     apply_dim_names,
     resolve_dim_names,
 )
+from sglang.srt.debug_utils.comparator.dp_utils import filter_to_non_empty_dp_rank
+from sglang.srt.debug_utils.comparator.meta_overrider import MetaOverrider
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     GeneralWarning,
@@ -44,12 +48,15 @@ def compare_bundle_pair(
     filenames_pair: Pair[list[str]],
     baseline_path: Path,
     target_path: Path,
+    token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
     viz_output_dir: Optional[Path] = None,
+    compute_per_token: bool = False,
+    meta_overrider: Optional[MetaOverrider] = None,
 ) -> Union[ComparisonRecord, SkipRecord, NonTensorRecord]:
     with warning_sink.context() as collected_warnings:
         result = _compare_bundle_pair_inner(
@@ -57,10 +64,13 @@ def compare_bundle_pair(
             filenames_pair=filenames_pair,
             baseline_path=baseline_path,
             target_path=target_path,
+            token_aligner_mode=token_aligner_mode,
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
             viz_output_dir=viz_output_dir,
+            compute_per_token=compute_per_token,
+            meta_overrider=meta_overrider,
         )
 
     return result.model_copy(update={"warnings": collected_warnings})
@@ -72,12 +82,15 @@ def _compare_bundle_pair_inner(
     filenames_pair: Pair[list[str]],
     baseline_path: Path,
     target_path: Path,
+    token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
     viz_output_dir: Optional[Path] = None,
+    compute_per_token: bool = False,
+    meta_overrider: Optional[MetaOverrider] = None,
 ) -> Union[ComparisonRecord, SkipRecord, NonTensorRecord]:
     # 1. Load all successfully loaded values
     all_pair: Pair[list[ValueWithMeta]] = Pair(
@@ -88,6 +101,30 @@ def _compare_bundle_pair_inner(
     if not all_pair.x or not all_pair.y:
         reason = "baseline_load_failed" if not all_pair.x else "target_load_failed"
         return SkipRecord(name=name, reason=reason)
+
+    # 1b. DP filter: keep only the non-empty dp_rank
+    all_pair = Pair(
+        x=filter_to_non_empty_dp_rank(all_pair.x),
+        y=filter_to_non_empty_dp_rank(all_pair.y),
+    )
+
+    # 1c. Dims override: patch meta["dims"] before downstream reads it
+    if meta_overrider is not None and not meta_overrider.is_empty:
+        _apply = meta_overrider.apply_to_meta
+        all_pair = Pair(
+            x=[
+                ValueWithMeta(
+                    value=v.value, meta=_apply(name=name, meta=v.meta, side="baseline")
+                )
+                for v in all_pair.x
+            ],
+            y=[
+                ValueWithMeta(
+                    value=v.value, meta=_apply(name=name, meta=v.meta, side="target")
+                )
+                for v in all_pair.y
+            ],
+        )
 
     # 2. Check if any side has non-tensor values → non-tensor display path
     has_non_tensor: bool = any(
@@ -100,10 +137,12 @@ def _compare_bundle_pair_inner(
     return _compare_bundle_pair_tensor_type(
         name=name,
         valid_pair=all_pair,
+        token_aligner_mode=token_aligner_mode,
         token_aligner_plan=token_aligner_plan,
         diff_threshold=diff_threshold,
         thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         viz_output_dir=viz_output_dir,
+        compute_per_token=compute_per_token,
     )
 
 
@@ -111,12 +150,14 @@ def _compare_bundle_pair_tensor_type(
     *,
     name: str,
     valid_pair: Pair[list[ValueWithMeta]],
+    token_aligner_mode: Optional[str],
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
     viz_output_dir: Optional[Path] = None,
+    compute_per_token: bool = False,
 ) -> Union[ComparisonRecord, SkipRecord]:
     if not valid_pair.x or not valid_pair.y:
         reason = "baseline_load_failed" if not valid_pair.x else "target_load_failed"
@@ -128,6 +169,7 @@ def _compare_bundle_pair_tensor_type(
     )
     plan: AlignerPlan = compute_aligner_plan(
         metas_pair=metas_pair,
+        token_aligner_mode=token_aligner_mode,
         token_aligner_plan=token_aligner_plan,
         thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
     )
@@ -146,12 +188,18 @@ def _compare_bundle_pair_tensor_type(
     aligner_result: AlignerResult = execute_aligner_plan(
         tensors_pair=tensors_pair, plan=plan
     )
+    replicated_checks = aligner_result.replicated_checks
 
     if aligner_result.tensors is None:
         assert aligner_result.failed_side_xy is not None
         side_name: str = _FAILED_SIDE_MAP[aligner_result.failed_side_xy]
         reason: str = f"{side_name}_load_failed"
         return SkipRecord(name=name, reason=reason)
+
+    # Resolve seq_dim for per-token computation
+    seq_dim: Optional[int] = (
+        _resolve_seq_dim(aligner_result.tensors.y) if compute_per_token else None
+    )
 
     # Compare
     aligned_baseline: torch.Tensor = aligner_result.tensors.x.rename(None)
@@ -162,8 +210,13 @@ def _compare_bundle_pair_tensor_type(
         x_target=aligned_target,
         name=name,
         diff_threshold=diff_threshold,
+        seq_dim=seq_dim,
     )
-    record = ComparisonRecord(**info.model_dump(), aligner_plan=plan)
+    record = ComparisonRecord(
+        **info.model_dump(),
+        aligner_plan=plan,
+        replicated_checks=replicated_checks,
+    )
 
     if viz_output_dir is not None:
         _try_generate_viz(
@@ -209,6 +262,19 @@ def _try_generate_viz(
         )
 
 
+def _resolve_seq_dim(tensor: torch.Tensor) -> Optional[int]:
+    """Find the token/seq dimension index from the tensor's named dims."""
+    if tensor.names[0] is None:
+        return None
+
+    names: tuple[Optional[str], ...] = tensor.names
+    for target_name in (TOKEN_DIM_NAME, SEQ_DIM_NAME):
+        if target_name in names:
+            return list(names).index(target_name)
+
+    return None
+
+
 def _compare_bundle_pair_non_tensor_type(
     *,
     name: str,
@@ -249,8 +315,16 @@ def _apply_dim_names_from_meta(
 
 
 def _load_all_values(filenames: list[str], base_path: Path) -> list[ValueWithMeta]:
-    return [
-        item
-        for f in filenames
-        if (item := ValueWithMeta.load(base_path / f)).value is not LOAD_FAILED
-    ]
+    result: list[ValueWithMeta] = []
+    for f in filenames:
+        item: ValueWithMeta = ValueWithMeta.load(base_path / f)
+        if item.value is LOAD_FAILED:
+            warning_sink.add(
+                GeneralWarning(
+                    category="load_failed",
+                    message=f"Failed to load tensor file: {f}",
+                )
+            )
+            continue
+        result.append(item)
+    return result
