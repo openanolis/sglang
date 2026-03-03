@@ -980,7 +980,7 @@ class HiRadixCache(RadixCache):
             # node is protected from eviction as it has ongoing prefetch, backup, or pin
             if x.host_ref_counter > 0:
                 continue
-                
+
             if x.host_value is None:
                 continue
 
