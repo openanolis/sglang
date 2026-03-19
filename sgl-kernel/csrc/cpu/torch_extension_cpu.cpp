@@ -36,7 +36,8 @@ at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 
 // layernorm
-void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor
+layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps);
 
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
@@ -46,7 +47,12 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
 // fused_add_layernorm
-void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
+at::Tensor fused_add_layernorm_cpu(
+    const at::Tensor& input,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    double eps);
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
@@ -306,6 +312,17 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& cos_sin_cache,
     bool is_neox);
 
+// mrope
+std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
+    int64_t head_size,
+    at::Tensor& cos_sin_cache,
+    const std::optional<std::vector<int64_t>>& mrope_section,
+    bool mrope_interleaved,
+    bool is_neox);
+
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
@@ -353,7 +370,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_rmsnorm_cpu", torch::kCPU, &gemma_rmsnorm_cpu);
   m.def("gemma3_rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
   m.impl("gemma3_rmsnorm_cpu", torch::kCPU, &gemma3_rmsnorm_cpu);
-  m.def("layernorm_cpu(Tensor(a!) input, Tensor weight, float eps) -> ()");
+  m.def("layernorm_cpu(Tensor input, Tensor weight, Tensor? bias, float eps) -> Tensor");
   m.impl("layernorm_cpu", torch::kCPU, &layernorm_cpu);
   m.def("l2norm_cpu(Tensor input, float eps) -> Tensor");
   m.impl("l2norm_cpu", torch::kCPU, &l2norm_cpu);
@@ -363,7 +380,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
   m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
-  m.def("fused_add_layernorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
+  m.def(
+      "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
+      "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
 
   // topk
@@ -518,6 +537,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
+  // multimodal rope
+  m.def(
+      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+  m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
