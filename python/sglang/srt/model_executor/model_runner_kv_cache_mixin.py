@@ -401,6 +401,13 @@ class ModelRunnerKVCacheMixin:
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         cache_params=config.mamba2_cache_params,
+                        mamba_layer_ids=(
+                            [
+                                i
+                                for i in config.mamba2_cache_params.layers
+                                if self.start_layer <= i < self.end_layer
+                            ]
+                        ),
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
