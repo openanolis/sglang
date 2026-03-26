@@ -436,6 +436,7 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                    start_layer=self.start_layer,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
@@ -617,6 +618,7 @@ class ModelRunnerKVCacheMixin:
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
+                    start_layer=self.start_layer,
                     **extra_args,
                 )
             else:

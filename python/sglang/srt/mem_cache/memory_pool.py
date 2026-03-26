@@ -459,6 +459,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
+        start_layer: Optional[int] = None,
     ):
         super().__init__(
             size=size,
@@ -470,7 +471,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        self.start_layer = 0
+        self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
             size=mamba_size,
@@ -1239,13 +1240,14 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        start_layer: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
-        self.start_layer = 0
+        self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim
