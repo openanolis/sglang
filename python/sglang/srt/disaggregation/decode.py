@@ -180,6 +180,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         pre_alloc_size: int,
         enable_overlap_schedule: bool,
         mamba_size: int = None,
+        start_layer: int = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -196,8 +197,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         effective_mamba_size = (
             mamba_size if mamba_size is not None else size
         ) + pre_alloc_size
-        # TODO: Support PP
-        self.start_layer = 0
+        self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
             size=effective_mamba_size,

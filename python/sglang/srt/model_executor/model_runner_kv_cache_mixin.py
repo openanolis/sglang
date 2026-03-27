@@ -413,6 +413,7 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
+                        start_layer=self.start_layer,
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(
