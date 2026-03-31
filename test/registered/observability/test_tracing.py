@@ -111,7 +111,7 @@ class LightweightOtlpCollector:
 
             self._server = grpc_server(futures.ThreadPoolExecutor(max_workers=4))
             add_TraceServiceServicer_to_server(TraceServicer(self), self._server)
-            self._server.add_insecure_port(f"0.0.0.0:{self.port}")
+            self._server.add_insecure_port(f"127.0.0.1:{self.port}")
             return True
         except ImportError:
             logger.warning("Full gRPC OTLP not available, using HTTP fallback")
@@ -131,10 +131,8 @@ class LightweightOtlpCollector:
     def _protobuf_to_dict(self, proto_obj) -> Dict[str, Any]:
         """Convert protobuf message to dict."""
         result = {}
-        for field in proto_obj.DESCRIPTOR.fields:
-            value = getattr(proto_obj, field.name)
+        for field, value in proto_obj.ListFields():
             if field.message_type:
-                # Check if repeated by type name
                 type_name = type(value).__name__
                 if "Repeated" in type_name:
                     result[field.name] = [self._protobuf_to_dict(v) for v in value]
@@ -203,7 +201,7 @@ class LightweightOtlpCollector:
                     lambda r, a, s: OTLPHandler(r, a, s),
                 )
 
-        server = CollectorHTTPServer(("0.0.0.0", 4318), self)
+        server = CollectorHTTPServer(("127.0.0.1", 4318), self)
         server.timeout = 0.5
         while self._running:
             server.handle_request()
@@ -353,7 +351,7 @@ def _subprocess_worker():
     """Worker function for subprocess trace context propagation test.
     Must be at module level for pickle compatibility with spawn.
     """
-    process_tracing_init("0.0.0.0:4317", "test")
+    process_tracing_init("127.0.0.1:4317", "test")
     trace_set_thread_info("Sub Process")
 
     context = zmq.Context(2)
@@ -397,7 +395,7 @@ class TestTracePackage(CustomTestCase):
         self._start_collector()
 
         try:
-            process_tracing_init("0.0.0.0:4317", "test")
+            process_tracing_init("127.0.0.1:4317", "test")
             trace_set_thread_info("Test")
             set_global_trace_level(3)
             req_context = TraceReqContext(0)
@@ -421,7 +419,7 @@ class TestTracePackage(CustomTestCase):
         self._start_collector()
 
         try:
-            process_tracing_init("0.0.0.0:4317", "test")
+            process_tracing_init("127.0.0.1:4317", "test")
             trace_set_thread_info("Test")
             set_global_trace_level(3)
             req_context = TraceReqContext(0)
@@ -461,7 +459,7 @@ class TestTracePackage(CustomTestCase):
         )
 
         try:
-            process_tracing_init("0.0.0.0:4317", "test")
+            process_tracing_init("127.0.0.1:4317", "test")
             trace_set_thread_info("Main Process")
 
             subproc = ctx.Process(target=_subprocess_worker)
@@ -508,7 +506,7 @@ class TestTraceServer(CustomTestCase):
             other_args=[
                 "--enable-trace",
                 "--otlp-traces-endpoint",
-                "0.0.0.0:4317",
+                "127.0.0.1:4317",
             ],
         )
 
@@ -528,14 +526,20 @@ class TestTraceServer(CustomTestCase):
     def setUp(self):
         """Wait for spans to be drained before each test."""
         max_wait_seconds = 10
-        check_interval = 2
+        check_interval = 0.2
         elapsed = 0
+        consecutive_zero_count = 0
+        required_consecutive_zeros = 3
 
         while elapsed < max_wait_seconds:
             span_count = self.collector.count_spans()
             if span_count == 0:
-                break
-            self.collector.clear()
+                consecutive_zero_count += 1
+                if consecutive_zero_count >= required_consecutive_zeros:
+                    break
+            else:
+                consecutive_zero_count = 0
+                self.collector.clear()
             time.sleep(check_interval)
             elapsed += check_interval
         else:
