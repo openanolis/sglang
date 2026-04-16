@@ -27,6 +27,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.observability.hicache_trace import (
+    trace_backup_enqueue,
+    trace_prefetch_enqueue,
+    trace_prefetch_query,
+)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -391,6 +396,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        trace_prefetch_enqueue(self, operation)
         self.prefetch_queue.put(operation)
         return operation
 
@@ -409,9 +415,11 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        trace_backup_enqueue(self, operation)
         self.backup_queue.put(operation)
         return operation.id
 
+    @trace_prefetch_query
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         hash_value = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
@@ -193,6 +194,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            start_ts = time.perf_counter()
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
@@ -212,6 +214,7 @@ class SchedulePolicy:
                 match_result.last_host_node,
                 match_result.host_hit_length,
             )
+            r.time_stats.trace_hicache_match_prefix(match_result, start_ts)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -828,6 +831,7 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                start_time = time.perf_counter()
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
@@ -839,6 +843,7 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                req.time_stats.trace_hicache_load_back(req.host_hit_length, start_time)
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
