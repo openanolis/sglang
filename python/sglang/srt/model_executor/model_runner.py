@@ -29,7 +29,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -289,6 +289,8 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 logger = logging.getLogger(__name__)
 
+_UNSET: Any = object()
+
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
@@ -531,6 +533,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
+        self._linear_attn_registry_cache: Any = _UNSET
+
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
@@ -563,9 +567,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
-
-        if not hasattr(self, "hisparse_coordinator"):
-            self.hisparse_coordinator = None
 
     def _build_model_config(
         self, server_args, model_path=None, model_revision=None, is_draft_model=False
@@ -2313,7 +2314,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     def _get_linear_attn_registry_result(self):
-        if not hasattr(self, "_linear_attn_registry_cache"):
+        if self._linear_attn_registry_cache is _UNSET:
             self._linear_attn_registry_cache = get_linear_attn_config(
                 self.model_config.hf_config
             )

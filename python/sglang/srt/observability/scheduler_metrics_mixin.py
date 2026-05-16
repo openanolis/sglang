@@ -162,6 +162,8 @@ class SchedulerMetricsMixin:
 
         self.fwd_occupancy = float("nan")
 
+        self.forward_pass_device_timer: Optional[DeviceTimer] = None
+
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
@@ -185,7 +187,7 @@ class SchedulerMetricsMixin:
         )
 
     def install_device_timer_on_runners(self: Scheduler):
-        if not hasattr(self, "forward_pass_device_timer"):
+        if self.forward_pass_device_timer is None:
             return
         timer = self.forward_pass_device_timer
         self.tp_worker.model_runner.device_timer = timer
@@ -237,7 +239,7 @@ class SchedulerMetricsMixin:
             def _fpm_device_timer_reporter(t, **_kwargs):
                 self._fpm_gpu_time_acc += t
 
-            if hasattr(self, "forward_pass_device_timer"):
+            if self.forward_pass_device_timer is not None:
                 self.forward_pass_device_timer.add_reporter(_fpm_device_timer_reporter)
             else:
                 self.forward_pass_device_timer = DeviceTimer(
@@ -923,14 +925,14 @@ class SchedulerMetricsMixin:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if hasattr(self, "running_mbs") and self.running_mbs:
+            if self.server_args.pp_size > 1:
                 for batch in self.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:
                             if hasattr(req, "lora_id") and req.lora_id is not None:
                                 active_lora_ids.add(req.lora_id)
             # For normal mode, check running_batch
-            elif hasattr(self, "running_batch") and self.running_batch:
+            elif self.running_batch:
                 if hasattr(self.running_batch, "reqs"):
                     for req in self.running_batch.reqs:
                         if hasattr(req, "lora_id") and req.lora_id is not None:
@@ -952,6 +954,7 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
+            # TODO: max_running_requests_under_SLO has no setter — sglang:utilization stuck at 0 (regressed #22713).
             max_under_slo = getattr(self, "max_running_requests_under_SLO", None)
             if max_under_slo is not None and max_under_slo > 0:
                 self.stats.utilization = max(
@@ -1040,7 +1043,7 @@ class SchedulerMetricsMixin:
 
         lora = None
         if include_all or "lora" in include:
-            if hasattr(self, "lora_scheduler") and self.lora_scheduler is not None:
+            if self.enable_lora:
                 lora = LoRAMetrics(
                     slots_used=self.stats.lora_pool_slots_used,
                     slots_total=self.stats.lora_pool_slots_total,

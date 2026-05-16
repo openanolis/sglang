@@ -349,6 +349,9 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
+        # init_soft_watchdog starts a daemon thread that reads these on its first tick.
+        self.forward_ct: int = 0
+        self.cur_batch: Optional[ScheduleBatch] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -781,9 +784,10 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
-        if self.enable_metrics and hasattr(self, "metrics_collector"):
+        if self.enable_metrics:
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
+                # TODO: max_running_requests_under_SLO has no setter — dead chain.
                 max_running_requests_under_SLO=getattr(
                     self, "max_running_requests_under_SLO", None
                 ),
