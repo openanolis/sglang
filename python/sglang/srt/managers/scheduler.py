@@ -148,10 +148,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import (
-    has_shm_features,
-    unwrap_shm_features,
-)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -168,20 +164,27 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    SchedulerDPAttnAdapter,
+)
+from sglang.srt.managers.scheduler_components.profiler_manager import (
+    SchedulerProfilerManager,
+)
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
     create_scheduler_watchdog,
-)
-from sglang.srt.managers.scheduler_update_weights_mixin import (
-    SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache import kv_cache_builder
@@ -209,7 +212,6 @@ from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
-    broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
     freeze_gc,
@@ -218,7 +220,6 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_mps,
     kill_itself_when_parent_died,
-    point_to_point_pyobj,
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -320,15 +321,12 @@ def validate_dflash_request(req: Req) -> Optional[str]:
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
-    SchedulerUpdateWeightsMixin,
-    SchedulerProfilerMixin,
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
-    SchedulerDPAttnMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -528,7 +526,11 @@ class Scheduler(
         self.init_watch_dog_memory_saver_input_blocker()
 
         # Init profiler
-        self.init_profiler()
+        self.profiler_manager = SchedulerProfilerManager(
+            ps=self.ps,
+            dp_tp_cpu_group=self.dp_tp_cpu_group,
+            get_forward_ct=lambda: self.forward_ct,
+        )
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
@@ -541,6 +543,15 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
+
+        self.weight_updater = SchedulerWeightUpdaterManager(
+            tp_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            tp_cpu_group=self.tp_cpu_group,
+            memory_saver_adapter=self.memory_saver_adapter,
+            flush_cache=self.flush_cache,
+            is_fully_idle=self.is_fully_idle,
+        )
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -562,6 +573,43 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
+
+        self.request_receiver = SchedulerRequestReceiver(
+            recv_from_tokenizer=self.recv_from_tokenizer,
+            recv_from_rpc=self.recv_from_rpc,
+            recv_skipper=self.recv_skipper,
+            input_blocker=self.input_blocker,
+            mm_receiver=self.mm_receiver,
+            ps=self.ps,
+            tp_group=self.tp_group,
+            tp_cpu_group=self.tp_cpu_group,
+            attn_tp_group=self.attn_tp_group,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_group=self.attn_cp_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            world_group=self.world_group,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            max_recv_per_poll=self.max_recv_per_poll,
+            stream_output=self.stream_output,
+            get_last_forward_mode=lambda: (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            ),
+        )
+
+        self.dp_attn_adapter = SchedulerDPAttnAdapter(
+            tp_group=self.tp_group,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            offload_tags=self.weight_updater.offload_tags,
+            ps=self.ps,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            get_require_mlp_sync=lambda: self.require_mlp_sync,
+        )
 
         self.is_initializing = False
 
@@ -999,7 +1047,6 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
-        self.offload_tags = set()
 
         # Init recv skipper and input blocker
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)
@@ -1259,9 +1306,18 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
-                (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
-                (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
-                (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
+                (
+                    UpdateWeightFromDiskReqInput,
+                    self.weight_updater.update_weights_from_disk,
+                ),
+                (
+                    InitWeightsUpdateGroupReqInput,
+                    self.weight_updater.init_weights_update_group,
+                ),
+                (
+                    DestroyWeightsUpdateGroupReqInput,
+                    self.weight_updater.destroy_weights_update_group,
+                ),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,
                     self.init_weights_send_group_for_remote_instance,
@@ -1272,16 +1328,37 @@ class Scheduler(
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
-                    self.update_weights_from_distributed,
+                    self.weight_updater.update_weights_from_distributed,
                 ),
-                (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
-                (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
-                (GetWeightsByNameReqInput, self.get_weights_by_name),
-                (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
-                (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
-                (CheckWeightsReqInput, self.check_weights),
+                (
+                    UpdateWeightsFromTensorReqInput,
+                    self.weight_updater.update_weights_from_tensor,
+                ),
+                (
+                    UpdateWeightsFromIPCReqInput,
+                    self.weight_updater.update_weights_from_ipc,
+                ),
+                (
+                    GetWeightsByNameReqInput,
+                    self.weight_updater.get_weights_by_name,
+                ),
+                (
+                    ReleaseMemoryOccupationReqInput,
+                    self.weight_updater.release_memory_occupation,
+                ),
+                (
+                    ResumeMemoryOccupationReqInput,
+                    self.weight_updater.resume_memory_occupation,
+                ),
+                (
+                    CheckWeightsReqInput,
+                    self.weight_updater.check_weights,
+                ),
                 (SlowDownReqInput, self.slow_down),
-                (ProfileReq, self.profile),
+                (
+                    ProfileReq,
+                    lambda req: self.profiler_manager._profile(req),
+                ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
@@ -1362,7 +1439,7 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1398,7 +1475,7 @@ class Scheduler(
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1471,197 +1548,6 @@ class Scheduler(
         )
 
         return disable_overlap_for_batch or need_grammar_sync
-
-    def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0:
-            return False
-        return num_recv_reqs >= self.max_recv_per_poll
-
-    def recv_requests(
-        self,
-    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-
-        if self.recv_skipper is not None:
-            last_forward_mode = (
-                self.last_batch.forward_mode if self.last_batch is not None else None
-            )
-            if not self.recv_skipper.handle(last_forward_mode):
-                return []
-
-        if self.ps.pp_rank == 0:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                recv_reqs = []
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
-            else:
-                recv_reqs = None
-        else:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
-            else:
-                recv_reqs = None
-
-        if self.input_blocker is not None:
-            recv_reqs = self.input_blocker.handle(recv_reqs)
-
-        if self.server_args.enable_dp_attention:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
-            else:
-                work_reqs = None
-                control_reqs = None
-
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
-
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
-            if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
-            elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
-
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
-            for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
-
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
-            #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
-            if (
-                not self.server_args.enable_dp_attention
-                and self.ps.tp_size > 1
-                and self.model_config.is_multimodal
-                and has_shm_features(recv_reqs)
-            ):
-                barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
-                unwrap_shm_features(req)
-
-        return recv_reqs
-
-    def _split_work_and_control_reqs(self, recv_reqs: List):
-        work_reqs = [
-            req
-            for req in recv_reqs
-            if isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
@@ -2397,7 +2283,7 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
+            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -2415,7 +2301,9 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
-        ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            ret, need_sync=need_mlp_sync
+        )
 
         # Handle ngram embedding
         ret = self._maybe_prepare_ngram_embedding(ret)
@@ -2869,7 +2757,7 @@ class Scheduler(
         batch.forward_iter = self.forward_ct
 
         # Whether to run the profiler
-        self._profile_batch_predicate(batch)
+        self.profiler_manager._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -3143,6 +3031,37 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def on_idle(self):
+        """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        if not self.is_fully_idle():
+            return
+
+        # memory leak check (skipped for hisparse — pool counters intentionally
+        # diverge during host-backup, see _get_swa_token_info clamp).
+        if not self.enable_hisparse:
+            has_leak, messages = self._check_all_pools(self.get_pool_stats())
+            if has_leak:
+                self._report_leak("pool", "\n".join(messages))
+            self._check_req_pool()
+
+        # tree cache sanity check
+        self._check_tree_cache()
+
+        # metrics every 30s
+        self._maybe_log_idle_metrics()
+
+        # kv event publishing
+        self._publish_kv_events()
+
+        # reset token ratio
+        self.new_token_ratio = self.init_new_token_ratio
+
+        # reset device timer window so idle time isn't counted
+        self.reset_device_timer_window()
+
+        # sleep until next event
+        self.maybe_sleep_on_idle()
+
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -3385,6 +3304,12 @@ class Scheduler(
             updated=True,
             server_args=vars(get_global_server_args()),
         )
+
+    def save_remote_model(self, **kwargs):
+        self.weight_updater.save_remote_model(kwargs)
+
+    def save_sharded_model(self, **kwargs):
+        self.weight_updater.save_sharded_model(kwargs)
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
