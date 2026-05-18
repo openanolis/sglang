@@ -167,6 +167,18 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.dp_attn import (
     SchedulerDPAttnAdapter,
 )
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    SchedulerInvariantChecker,
+)
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+    SchedulerKvEventsPublisher,
+)
+from sglang.srt.managers.scheduler_components.load_inquirer import (
+    SchedulerLoadInquirer,
+)
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    SchedulerPoolStatsObserver,
+)
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -184,7 +196,6 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
-    create_scheduler_watchdog,
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache import kv_cache_builder
@@ -235,6 +246,7 @@ from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -317,6 +329,30 @@ def validate_dflash_request(req: Req) -> Optional[str]:
         )
 
     return None
+
+
+def create_scheduler_watchdog(
+    scheduler: "Scheduler", watchdog_timeout: float, soft: bool = False
+) -> WatchdogRaw:
+    def dump_info() -> str:
+        if scheduler.is_initializing:
+            return ""
+        _, messages = scheduler.invariant_checker._check_all_pools(
+            scheduler.pool_stats_observer.get_pool_stats(),
+        )
+        return (
+            f"{scheduler.cur_batch.batch_size()=}\n"
+            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
+        )
+
+    return WatchdogRaw(
+        debug_name="Scheduler",
+        get_counter=lambda: scheduler.forward_ct,
+        is_active=lambda: scheduler.is_initializing or scheduler.cur_batch is not None,
+        watchdog_timeout=watchdog_timeout,
+        soft=soft,
+        dump_info=dump_info,
+    )
 
 
 class Scheduler(
@@ -461,7 +497,11 @@ class Scheduler(
             tp_cpu_group=self.tp_cpu_group,
             attn_cp_cpu_group=self.attn_cp_cpu_group,
             enable_metrics=self.enable_metrics,
-            enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_kv_cache_events=bool(
+                self.server_args.kv_events_config
+                and self.ps.attn_tp_rank == 0
+                and self.ps.attn_cp_rank == 0
+            ),
             ps=self.ps,
             tp_group=self.tp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
@@ -611,6 +651,75 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
 
+        self.pool_stats_observer = SchedulerPoolStatsObserver(
+            tree_cache=self.tree_cache,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+            session_controller=self.session_controller,
+            hisparse_coordinator=self.hisparse_coordinator,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_ssm=self.is_hybrid_ssm,
+            enable_hisparse=self.enable_hisparse,
+            full_tokens_per_layer=self.full_tokens_per_layer,
+            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            max_total_num_tokens=self.max_total_num_tokens,
+            get_last_batch=lambda: self.last_batch,
+            get_running_batch=lambda: self.running_batch,
+        )
+
+        self.invariant_checker = SchedulerInvariantChecker(
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_ssm=self.is_hybrid_ssm,
+            disaggregation_mode=self.disaggregation_mode,
+            page_size=self.page_size,
+            full_tokens_per_layer=self.full_tokens_per_layer,
+            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            max_total_num_tokens=self.max_total_num_tokens,
+            server_args=self.server_args,
+            tree_cache=self.tree_cache,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+            pool_stats_observer=self.pool_stats_observer,
+            get_last_batch=lambda: self.last_batch,
+            get_running_batch=lambda: self.running_batch,
+        )
+
+        self.kv_events_publisher = SchedulerKvEventsPublisher(
+            kv_events_config=self.server_args.kv_events_config,
+            ps=self.ps,
+            attn_tp_rank=self.ps.attn_tp_rank,
+            attn_cp_rank=self.ps.attn_cp_rank,
+            attn_dp_rank=self.ps.attn_dp_rank,
+            dp_rank=self.ps.dp_rank,
+            tree_cache=self.tree_cache,
+            send_metrics_from_scheduler=self.send_metrics_from_scheduler,
+            max_running_requests=self.max_running_requests,
+            max_total_num_tokens=self.max_total_num_tokens,
+            get_stats=lambda: self.stats,
+        )
+
+        self.load_inquirer = SchedulerLoadInquirer(
+            disaggregation_mode=self.disaggregation_mode,
+            ps=self.ps,
+            server_args=self.server_args,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.max_running_requests,
+            pool_stats_observer=self.pool_stats_observer,
+            tp_worker=self.tp_worker,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            spec_algorithm=self.spec_algorithm,
+            get_running_batch=lambda: self.running_batch,
+            get_waiting_queue=lambda: self.waiting_queue,
+            get_stats=lambda: self.stats,
+            get_chunked_req=lambda: self.chunked_req,
+            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
+            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
+            get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_spec_total_num_accept_tokens=lambda: self.spec_total_num_accept_tokens,
+            get_spec_total_num_forward_ct=lambda: self.spec_total_num_forward_ct,
+        )
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -647,6 +756,7 @@ class Scheduler(
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
+        self.send_metrics_from_scheduler = None
 
         if (
             self.ps.pp_rank == 0
@@ -1370,7 +1480,10 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (GetLoadsReqInput, self.get_loads),
+                (
+                    GetLoadsReqInput,
+                    lambda req: self.get_loads(self.load_inquirer, req),
+                ),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -1459,7 +1572,7 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy()
+                self.invariant_checker.self_check_during_busy()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -1514,7 +1627,7 @@ class Scheduler(
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy()
+                self.invariant_checker.self_check_during_busy()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
@@ -2324,7 +2437,9 @@ class Scheduler(
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
-            max_pool_usage = self.get_pool_stats().get_max_pool_usage()
+            max_pool_usage = (
+                self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+            )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
@@ -2544,11 +2659,12 @@ class Scheduler(
             self.running_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self._get_num_pending_tokens(
+                self.load_inquirer,
                 chunk_deduct=(
                     self.chunked_req.extend_input_len
                     if self.chunked_req is not None
                     else 0
-                )
+                ),
             ),
         )
 
@@ -3039,19 +3155,21 @@ class Scheduler(
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
-            has_leak, messages = self._check_all_pools(self.get_pool_stats())
+            has_leak, messages = self.invariant_checker._check_all_pools(
+                self.pool_stats_observer.get_pool_stats(),
+            )
             if has_leak:
-                self._report_leak("pool", "\n".join(messages))
-            self._check_req_pool()
+                self.invariant_checker._report_leak("pool", "\n".join(messages))
+            self.invariant_checker._check_req_pool()
 
         # tree cache sanity check
-        self._check_tree_cache()
+        self.invariant_checker._check_tree_cache()
 
         # metrics every 30s
         self._maybe_log_idle_metrics()
 
         # kv event publishing
-        self._publish_kv_events()
+        self.kv_events_publisher.publish_kv_events()
 
         # reset token ratio
         self.new_token_ratio = self.init_new_token_ratio

@@ -7,7 +7,6 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -35,6 +34,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
+    from sglang.srt.managers.scheduler_components.load_inquirer import (
+        SchedulerLoadInquirer,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -72,18 +74,6 @@ class PrefillStats:
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
         )
-
-
-@dataclasses.dataclass
-class KvMetrics:
-    request_active_slots: int = 0
-    request_total_slots: int = 0
-    kv_active_blocks: int = 0
-    kv_total_blocks: int = 0
-    num_requests_waiting: int = 0
-    gpu_cache_usage_perc: float = 0.0
-    gpu_prefix_cache_hit_rate: float = 0.0
-    data_parallel_rank: int = 0
 
 
 class SchedulerMetricsMixin:
@@ -178,8 +168,6 @@ class SchedulerMetricsMixin:
                 reporter=_wrap_execution_reporter,
             )
 
-        self.init_kv_events(self.server_args.kv_events_config)
-
         self._init_fpm()
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
@@ -198,16 +186,6 @@ class SchedulerMetricsMixin:
                     dw.draft_runner.device_timer = timer
                 for r in getattr(dw, "draft_runner_list", []):
                     r.device_timer = timer
-
-    def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
-        self.enable_kv_cache_events = bool(
-            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
-        )
-
-        if self.enable_kv_cache_events:
-            self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.ps.attn_dp_rank
-            )
 
     def _init_fpm(self: Scheduler):
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
@@ -499,7 +477,7 @@ class SchedulerMetricsMixin:
             prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
 
-        pool_stats = self.get_pool_stats()
+        pool_stats = self.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
@@ -609,8 +587,8 @@ class SchedulerMetricsMixin:
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
-            self._emit_kv_metrics()
-        self._publish_kv_events()
+            self.kv_events_publisher.emit_kv_metrics()
+        self.kv_events_publisher.publish_kv_events()
 
     def report_decode_stats(
         self: Scheduler,
@@ -660,7 +638,7 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
 
-        pool_stats = self.get_pool_stats()
+        pool_stats = self.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
         if RECORD_STEP_TIME:
@@ -779,8 +757,12 @@ class SchedulerMetricsMixin:
                 )
 
             # Streaming session metrics
-            self.stats.num_streaming_sessions = self._streaming_session_count()
-            self.stats.streaming_session_held_tokens = self._session_held_tokens()
+            self.stats.num_streaming_sessions = (
+                self.pool_stats_observer.streaming_session_count()
+            )
+            self.stats.streaming_session_held_tokens = (
+                self.pool_stats_observer.session_held_tokens()
+            )
 
             # Routing key metrics
             # (to reduce the overhead, we only compute this when all requests have routing_key)
@@ -801,8 +783,8 @@ class SchedulerMetricsMixin:
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
-            self._emit_kv_metrics()
-        self._publish_kv_events()
+            self.kv_events_publisher.emit_kv_metrics()
+        self.kv_events_publisher.publish_kv_events()
 
     def log_batch_result_stats(
         self: Scheduler,
@@ -819,36 +801,6 @@ class SchedulerMetricsMixin:
                 forward_mode=batch.forward_mode.name.lower(),
                 balancedness=m.eplb_balancedness.item(),
             )
-
-    def _emit_kv_metrics(self: Scheduler):
-        if not self.enable_kv_cache_events:
-            return
-
-        kv_metrics = KvMetrics()
-        kv_metrics.request_active_slots = self.stats.num_running_reqs.total
-        kv_metrics.request_total_slots = self.max_running_requests
-        kv_metrics.kv_active_blocks = int(
-            self.stats.token_usage * self.max_total_num_tokens
-        )
-        kv_metrics.kv_total_blocks = self.max_total_num_tokens
-        kv_metrics.num_requests_waiting = self.stats.num_queue_reqs.total
-        kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
-        kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
-        kv_metrics.data_parallel_rank = (
-            self.ps.dp_rank if self.ps.dp_rank is not None else 0
-        )
-
-        if not self.send_metrics_from_scheduler.closed:
-            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
-
-    def _publish_kv_events(self: Scheduler):
-        if not self.enable_kv_cache_events:
-            return
-
-        events = self.tree_cache.take_events()
-        if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)
 
     def _emit_forward_pass_metrics(
         self: Scheduler,
@@ -964,7 +916,10 @@ class SchedulerMetricsMixin:
                     self.stats.token_usage / 0.9,
                 )
 
-    def _get_num_pending_tokens(self: Scheduler, chunk_deduct: int = 0) -> int:
+    @staticmethod
+    def _get_num_pending_tokens(
+        self: "SchedulerLoadInquirer", chunk_deduct: int = 0
+    ) -> int:
         """Get the total number of tokens pending prefill.
 
         This includes tokens from waiting queue requests plus remaining tokens
@@ -978,13 +933,16 @@ class SchedulerMetricsMixin:
                 time ``prefix_indices`` is already up-to-date, so the default
                 0 is correct.
         """
-        num_pending_tokens = sum(req.seqlen for req in self.waiting_queue)
-        if self.chunked_req is not None:
-            req = self.chunked_req
+        num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
+        if self.get_chunked_req() is not None:
+            req = self.get_chunked_req()
             num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
         return num_pending_tokens
 
-    def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
+    @staticmethod
+    def get_loads(
+        self: "SchedulerLoadInquirer", req: GetLoadsReqInput = None
+    ) -> GetLoadsReqOutput:
         """
         Get comprehensive load metrics for /v1/loads endpoint.
 
@@ -1000,18 +958,22 @@ class SchedulerMetricsMixin:
         include = set(req.include) if req.include else {"core"}
         include_all = "all" in include
 
-        num_running_reqs = len(self.running_batch.reqs)
+        num_running_reqs = len(self.get_running_batch().reqs)
 
-        waiting_queues = [self.waiting_queue]
+        waiting_queues = [self.get_waiting_queue()]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_queues.append(self.get_disagg_prefill_bootstrap_queue().queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
-            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
-            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+            waiting_queues.append(self.get_disagg_decode_prealloc_queue().queue)
+            waiting_queues.append(self.get_disagg_decode_transfer_queue().queue)
+            waiting_queues.append(
+                self.get_disagg_decode_prealloc_queue().retracted_queue
+            )
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-        num_used_tokens, kv_token_usage = self.get_pool_stats().get_kv_token_stats()
+        num_used_tokens, kv_token_usage = (
+            self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
+        )
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in waiting_queues for req in queue
         )
@@ -1034,22 +996,25 @@ class SchedulerMetricsMixin:
 
         speculative = None
         if include_all or "spec" in include:
-            if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
+            if (
+                not self.spec_algorithm.is_none()
+                and self.get_spec_total_num_forward_ct() > 0
+            ):
                 speculative = SpeculativeMetrics(
                     accept_length=(
-                        self.spec_total_num_accept_tokens
-                        / self.spec_total_num_forward_ct
+                        self.get_spec_total_num_accept_tokens()
+                        / self.get_spec_total_num_forward_ct()
                     ),
-                    accept_rate=self.stats.spec_accept_rate,
+                    accept_rate=self.get_stats().spec_accept_rate,
                 )
 
         lora = None
         if include_all or "lora" in include:
-            if self.enable_lora:
+            if self.server_args.enable_lora:
                 lora = LoRAMetrics(
-                    slots_used=self.stats.lora_pool_slots_used,
-                    slots_total=self.stats.lora_pool_slots_total,
-                    utilization=self.stats.lora_pool_utilization,
+                    slots_used=self.get_stats().lora_pool_slots_used,
+                    slots_total=self.get_stats().lora_pool_slots_total,
+                    utilization=self.get_stats().lora_pool_utilization,
                 )
 
         disaggregation = None
@@ -1063,14 +1028,14 @@ class SchedulerMetricsMixin:
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
-                prefill_bootstrap = len(self.disagg_prefill_bootstrap_queue.queue)
-                prefill_inflight = len(self.disagg_prefill_inflight_queue)
+                prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
+                prefill_inflight = len(self.get_disagg_prefill_inflight_queue())
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 mode_str = "decode"
-                decode_prealloc = len(self.disagg_decode_prealloc_queue.queue)
-                decode_transfer = len(self.disagg_decode_transfer_queue.queue)
+                decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)
+                decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)
                 decode_retracted = len(
-                    self.disagg_decode_prealloc_queue.retracted_queue
+                    self.get_disagg_decode_prealloc_queue().retracted_queue
                 )
 
             disaggregation = DisaggregationMetrics(
@@ -1080,17 +1045,17 @@ class SchedulerMetricsMixin:
                 decode_prealloc_queue_reqs=decode_prealloc,
                 decode_transfer_queue_reqs=decode_transfer,
                 decode_retracted_queue_reqs=decode_retracted,
-                kv_transfer_speed_gb_s=self.stats.kv_transfer_speed_gb_s,
-                kv_transfer_latency_ms=self.stats.kv_transfer_latency_ms,
+                kv_transfer_speed_gb_s=self.get_stats().kv_transfer_speed_gb_s,
+                kv_transfer_latency_ms=self.get_stats().kv_transfer_latency_ms,
             )
 
         queues = None
         if include_all or "queues" in include:
             queues = QueueMetrics(
-                waiting=len(self.waiting_queue),
-                grammar=self.stats.num_grammar_queue_reqs,
-                paused=self.stats.num_paused_reqs,
-                retracted=self.stats.num_retracted_reqs,
+                waiting=len(self.get_waiting_queue()),
+                grammar=self.get_stats().num_grammar_queue_reqs,
+                paused=self.get_stats().num_paused_reqs,
+                retracted=self.get_stats().num_retracted_reqs,
             )
 
         return GetLoadsReqOutput(
@@ -1102,9 +1067,9 @@ class SchedulerMetricsMixin:
             num_total_tokens=num_total_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             token_usage=round(kv_token_usage, 4),
-            gen_throughput=round(self.stats.gen_throughput, 2),
-            cache_hit_rate=round(self.stats.cache_hit_rate, 4),
-            utilization=round(self.stats.utilization, 4),
+            gen_throughput=round(self.get_stats().gen_throughput, 2),
+            cache_hit_rate=round(self.get_stats().cache_hit_rate, 4),
+            utilization=round(self.get_stats().utilization, 4),
             max_running_requests=self.max_running_requests,
             memory=memory,
             speculative=speculative,
