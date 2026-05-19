@@ -92,7 +92,7 @@ class SchedulerDllmMixin:
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
@@ -137,7 +137,7 @@ class SchedulerDllmMixin:
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
-            self.new_token_ratio,
+            self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
