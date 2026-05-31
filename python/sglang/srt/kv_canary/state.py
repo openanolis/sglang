@@ -13,10 +13,10 @@ from sglang.srt.kv_canary.config import CanaryConfig
 class ViolationLog:
     """Global violation sink shared across all canary launches.
 
-    One instance per canary runner — every launch (head / tail, K / V half, FULL / SWA group) writes
+    One instance per canary runner — every launch (head / tail / sweep, K / V half, FULL / SWA group) writes
     into the same ring. The kernel_kind field stamped into each violation row identifies which launch fired
     (kernel_kind is a static IntEnum tag — :class:`CanaryLaunchTag` in
-    ``sglang.jit_kernel.kv_canary.verify`` — with a unique value per (head|tail, K|V, FULL|SWA) tuple).
+    ``sglang.jit_kernel.kv_canary.verify`` — with a unique value per (head|tail|sweep, K|V, FULL|SWA) tuple).
 
     Ring capacity is sized generously (≥ 1024) so overflow is a non-concern in practice — violations are
     cold-path and the host raises at the first one anyway (or just logs it in mode="log"). atomicAdd
@@ -63,7 +63,7 @@ class CanaryDeviceState:
     no per-step allocation.
 
     Fields:
-        violation_log: The single ViolationLog shared by every launch (head / tail × K / V ×
+        violation_log: The single ViolationLog shared by every launch (head / tail / sweep × K / V ×
             FULL / SWA). All kernels atomicAdd into violation_log.violation_write_index and stamp their
             CanaryLaunchTag into each violation row.
         kernel_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. The
@@ -80,11 +80,11 @@ class CanaryDeviceState:
         req_to_verify_expected_tokens: Optional int32 device tensor shape
             ``[req_to_token_alloc_size, max_context_len]``. Mirrors ReqToTokenPool layout;
             ``pool[req_idx, p]`` = source-of-truth token at logical position ``p`` for the
-            req in slot ``req_idx``. The plan-side entries kernel gathers from this pool (via
-            ``kv_token_id_vs_position_offset`` per buffer group) into
-            ``VerifyPlan.verify_expected_tokens``; the verify kernel then compares against each
-            canary slot's stored token. The naive build never populates the verify-token-id
-            cross-check, so this is always ``None`` and the gather degrades to the ``-1`` sentinel.
+            req in slot ``req_idx``. Allocated only when
+            ``CanaryConfig.enable_verify_token_assert`` is True. The plan-side entries
+            kernel gathers from this pool (via ``kv_token_id_vs_position_offset`` per buffer
+            group) into ``VerifyPlan.verify_expected_tokens``; the verify kernel then
+            compares against each canary slot's stored token.
     """
 
     violation_log: ViolationLog
@@ -113,10 +113,19 @@ class CanaryDeviceState:
         kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         enable_chain_position_assert = torch.ones(1, dtype=torch.int32, device=device)
-        # The naive build does not run the verify-token-id cross-check, so the source-of-truth
-        # token pool is never allocated. The field is kept on the dataclass and downstream code
-        # (plan kernel gather) treats ``None`` as "emit the -1 skip sentinel".
-        req_to_verify_expected_tokens = None
+        if config.enable_verify_token_assert:
+            if req_to_token_alloc_size is None or max_context_len is None:
+                raise ValueError(
+                    "kv-canary: CanaryDeviceState.allocate requires req_to_token_alloc_size "
+                    "and max_context_len when CanaryConfig.enable_verify_token_assert is on"
+                )
+            req_to_verify_expected_tokens = torch.empty(
+                (req_to_token_alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            req_to_verify_expected_tokens = None
         return cls(
             violation_log=violation_log,
             kernel_run_counters=kernel_run_counters,

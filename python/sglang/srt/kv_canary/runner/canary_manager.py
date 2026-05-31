@@ -16,15 +16,22 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReporter
+from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.single_forward_manager.manager import (
     SingleForwardManager,
     _PreOpsMaybeInsideGraphOutput,
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -35,15 +42,21 @@ class CanaryManager:
         self,
         *,
         config: CanaryConfig,
+        perturb_config: PerturbConfig,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
         req_to_token_pool: "ReqToTokenPool",
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
+        token_oracle_manager: Optional[TokenOracleManager] = None,
+        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
+        speculative_num_steps: int = 1,
+        is_eagle_draft_decode: bool = False,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
+        self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._outer_step_counter: int = 0
         self._active_single_forward_manager_index: Optional[int] = None
 
@@ -76,13 +89,46 @@ class CanaryManager:
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
+        swa_divergence_interval = (
+            envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.get()
+        )
+        if swa_divergence_interval > 0:
+            self._swa_divergence_report: Optional[SwaDivergenceReporter] = (
+                SwaDivergenceReporter(
+                    device=device,
+                    d2h_stream=self._d2h_stream,
+                    interval=swa_divergence_interval,
+                    swa_allocator=self._swa_allocator,
+                    req_to_token_pool=self._req_to_token_pool,
+                )
+            )
+        else:
+            self._swa_divergence_report = None
+
         self._violation_manager = ViolationManager(
             config=config,
             device_state=self._device_state,
             d2h_stream=self._d2h_stream,
             outer_step_counter_getter=self._get_outer_step_counter,
         )
-        self._single_forward_managers: tuple[SingleForwardManager, ...] = (
+        self._sweep_orchestrator = SweepOrchestrator(
+            config=config,
+            device_state=self._device_state,
+            buffer_groups=self._buffer_groups,
+            endpoints=self._endpoints,
+            swa_window_size=self._swa_window_size,
+            outer_step_counter_getter=self._get_outer_step_counter,
+        )
+        self._perturb_manager = PerturbManager(
+            config=perturb_config,
+            req_to_token_pool=req_to_token_pool,
+            buffer_groups=self._buffer_groups,
+            outer_step_counter_getter=self._get_outer_step_counter,
+            swa_window_size=self._swa_window_size,
+            sweep_interval=config.sweep_interval,
+        )
+        num_sfms = max(1, speculative_num_steps - 1)
+        self._single_forward_managers: tuple[SingleForwardManager, ...] = tuple(
             SingleForwardManager(
                 config=config,
                 device=device,
@@ -95,7 +141,11 @@ class CanaryManager:
                 per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
                 per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
                 d2h_stream=self._d2h_stream,
-            ),
+                token_oracle_manager=token_oracle_manager,
+                swa_divergence_report=self._swa_divergence_report,
+                is_eagle_draft_decode=is_eagle_draft_decode,
+            )
+            for _ in range(num_sfms)
         )
 
     @contextlib.contextmanager
@@ -165,6 +215,9 @@ class CanaryManager:
             self._single_forward_managers[idx].pre_ops_outside_graph(
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
+        self._perturb_manager.perturb(
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+        )
 
     def _post_ops_outside_graph(
         self,
@@ -174,13 +227,26 @@ class CanaryManager:
     ) -> None:
         for idx in single_forward_indices:
             self._single_forward_managers[idx].post_ops_outside_graph()
+        self._perturb_manager.perturb_post_forward(
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+        )
+        self._sweep_orchestrator.maybe_run_sweep()
         self._outer_step_counter += 1
         self._violation_manager.step()
+        if self._swa_divergence_report is not None:
+            self._swa_divergence_report.step(
+                outer_step_counter=self._outer_step_counter,
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
+            )
 
     def mark_init_finished(self) -> None:
         for single_forward_manager in self._single_forward_managers:
             single_forward_manager.phase_checker.enable_assert()
         self._device_state.enable_chain_position_assert.fill_(1)
+
+    def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
+        self._sweep_orchestrator.attach_radix_cache(radix_cache)
+        self._perturb_manager.attach_radix_cache(radix_cache)
 
     def _get_outer_step_counter(self) -> int:
         return self._outer_step_counter

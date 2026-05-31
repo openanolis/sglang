@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from sglang.jit_kernel.kv_canary.consts import (
+    RealKvHashMode,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -20,7 +23,7 @@ class CanaryMode(str, Enum):
 class CanaryConfig:
     """Top-level canary configuration. All knobs live here; nothing reads env vars deeper in the stack.
 
-    Constructed once inside install_canary(server_args, model_runner) via
+    Constructed once inside install_canary(server_args, model_runner, token_oracle_manager) via
     CanaryConfig.from_env(server_args), then frozen and threaded through the canary stack.
     Subsequent runtime never mutates it.
 
@@ -30,10 +33,28 @@ class CanaryConfig:
             violations propagate to host as RuntimeError after the next D2H pump.
         ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously;
             overflow only drops detail beyond row N, the monotonic counter still grows.
+        sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
+            additionally walks all radix-tree-held slots (overlap with per-forward HEAD/TAIL is harmless
+            redundancy) and verifies them.
+        real_kv_hash_mode: RealKvHashMode (NONE / PARTIAL / ALL). Uniform across head/tail/sweep launches;
+            PARTIAL (first 16B, hard cap) is cheap enough for production defaults.
+        enable_write_input_assert: bool. True = launch_canary_write_kernel additionally compares
+            forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
+            expected_input_positions[i]; mismatch records a violation. Only useful when something else
+            (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
+            per forward — canary itself knows no oracle.
+        enable_verify_token_assert: bool. True = real-model token-id validator: build
+            expected_tokens from each req's ``origin_input_ids + output_ids`` (snapshotted at
+            ForwardBatch.init_new) and compare against the canary's stored tokens at verify time.
+            Independent of ``enable_write_input_assert``.
     """
 
     mode: CanaryMode
     ring_capacity: int
+    sweep_interval: int
+    real_kv_hash_mode: RealKvHashMode
+    enable_write_input_assert: bool
+    enable_verify_token_assert: bool
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
@@ -43,7 +64,13 @@ class CanaryConfig:
                 f"kv-canary: kv_canary must be one of none/log/raise, got {mode_raw!r}"
             )
 
+        real_kv_raw = server_args.kv_canary_real_data.strip().upper()
+
         return cls(
             mode=CanaryMode(mode_raw),
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
+            sweep_interval=server_args.kv_canary_sweep_interval,
+            real_kv_hash_mode=RealKvHashMode[real_kv_raw],
+            enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
+            enable_verify_token_assert=envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get(),
         )

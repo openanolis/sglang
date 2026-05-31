@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
@@ -36,6 +37,7 @@ def _make_endpoint(*, device, kernel_kind=CanaryLaunchTag.HEAD_K_FULL, swa_lut=N
         kernel_kind=kernel_kind,
         canary_buf=canary_buf,
         full_to_swa_index_mapping=swa_lut,
+        real_kv_sources=(),
         slot_run_counter_view=slot_view,
         kernel_run_counter_view=kernel_view,
         enable_chain_position_assert=enable_chain_position_assert,
@@ -56,12 +58,36 @@ def _make_kernel_args(device):
         enable_write_input_assert=False,
         enable_verify_token_assert=False,
         expected_inputs=ExpectedInputs.allocate(capacity=1, device=device),
+        real_kv_hash_mode=RealKvHashMode.NONE,
     )
 
 
 class TestSelfUnitEndpoint(CustomTestCase):
     def setUp(self):
         self.device = DEFAULT_DEVICE
+
+    def test_launch_sweep_only_calls_verify(self):
+        """Verify sweep launch invokes only the verify kernel."""
+        calls: list[str] = []
+        with patch.object(
+            endpoint_module,
+            "launch_canary_verify_kernel",
+            lambda **kwargs: calls.append("verify"),
+        ), patch.object(
+            endpoint_module,
+            "launch_canary_write_kernel",
+            lambda **kwargs: calls.append("write"),
+        ):
+            ep = _make_endpoint(
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
+            )
+            args = _make_kernel_args(self.device)
+            ep.launch_sweep(
+                verify_plan=args.verify_plan,
+                violation_log=args.violation_log,
+                real_kv_hash_mode=args.real_kv_hash_mode,
+            )
+        self.assertEqual(calls, ["verify"])
 
     def test_launch_per_forward_passes_kernel_kind(self):
         """Verify per-forward launch passes the endpoint kernel kind."""
@@ -89,6 +115,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 enable_verify_token_assert=args.enable_verify_token_assert,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
+                real_kv_hash_mode=args.real_kv_hash_mode,
             )
         self.assertIn(("verify", CanaryLaunchTag.TAIL_V_SWA), captured)
         self.assertIn(("write", CanaryLaunchTag.TAIL_V_SWA), captured)
@@ -109,34 +136,22 @@ class TestSelfUnitEndpoint(CustomTestCase):
         ):
             shared_log = ViolationLog.allocate(ring_capacity=2, device=self.device)
             ep_a = _make_endpoint(
-                device=self.device, kernel_kind=CanaryLaunchTag.HEAD_K_FULL
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
             )
             ep_b = _make_endpoint(
-                device=self.device, kernel_kind=CanaryLaunchTag.HEAD_V_FULL
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_V_FULL
             )
 
-            args = _make_kernel_args(self.device)
-            ep_a.launch_per_forward(
-                verify_plan=args.verify_plan,
-                write_plan=args.write_plan,
-                input_ids=args.input_ids,
-                positions=args.positions,
-                out_cache_loc=args.out_cache_loc,
-                enable_write_input_assert=args.enable_write_input_assert,
-                enable_verify_token_assert=args.enable_verify_token_assert,
-                expected_inputs=args.expected_inputs,
+            plan = VerifyPlan.allocate(verify_capacity=1, device=self.device)
+            ep_a.launch_sweep(
+                verify_plan=plan,
                 violation_log=shared_log,
+                real_kv_hash_mode=RealKvHashMode.NONE,
             )
-            ep_b.launch_per_forward(
-                verify_plan=args.verify_plan,
-                write_plan=args.write_plan,
-                input_ids=args.input_ids,
-                positions=args.positions,
-                out_cache_loc=args.out_cache_loc,
-                enable_write_input_assert=args.enable_write_input_assert,
-                enable_verify_token_assert=args.enable_verify_token_assert,
-                expected_inputs=args.expected_inputs,
+            ep_b.launch_sweep(
+                verify_plan=plan,
                 violation_log=shared_log,
+                real_kv_hash_mode=RealKvHashMode.NONE,
             )
         self.assertEqual(captured_rings[0], captured_rings[1])
         self.assertEqual(captured_rings[0], shared_log.violation_ring.data_ptr())
@@ -175,6 +190,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 enable_verify_token_assert=args.enable_verify_token_assert,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
+                real_kv_hash_mode=args.real_kv_hash_mode,
             )
             full_ep.launch_per_forward(
                 verify_plan=args.verify_plan,
@@ -186,6 +202,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 enable_verify_token_assert=args.enable_verify_token_assert,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
+                real_kv_hash_mode=args.real_kv_hash_mode,
             )
         # SWA call: out_cache_loc was rewritten via lut gather (so identity-shifted by +100 here).
         expected_swa = lut[args.out_cache_loc]
@@ -227,6 +244,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 enable_verify_token_assert=args.enable_verify_token_assert,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
+                real_kv_hash_mode=args.real_kv_hash_mode,
             )
 
         self.assertTrue(

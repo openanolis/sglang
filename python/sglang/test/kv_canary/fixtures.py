@@ -6,10 +6,12 @@ from typing import List, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
+from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patcher.adapters.mha import attach_mha
+from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patcher.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -35,6 +37,48 @@ class FakeMHAPool:
         return ptrs, lens, item_lens
 
 
+@dataclass
+class FakeSwaSubPool:
+    k_buffer: List[torch.Tensor]
+    v_buffer: List[torch.Tensor]
+
+
+@dataclass
+class FakeSWAPool:
+    full_kv_pool: object
+    swa_kv_pool: object
+    full_to_swa_index_mapping: torch.Tensor
+    page_size: int = 1
+
+    def get_contiguous_buf_infos(self):
+        return _kv_buf_infos(
+            k_buffer=self.full_kv_pool.k_buffer,
+            v_buffer=self.full_kv_pool.v_buffer,
+            page_size=self.page_size,
+        )
+
+    def get_state_buf_infos(self):
+        return _kv_buf_infos(
+            k_buffer=self.swa_kv_pool.k_buffer,
+            v_buffer=self.swa_kv_pool.v_buffer,
+            page_size=self.page_size,
+        )
+
+
+def _kv_buf_infos(
+    *,
+    k_buffer: List[torch.Tensor],
+    v_buffer: List[torch.Tensor],
+    page_size: int,
+) -> tuple:
+    ptrs = [b.data_ptr() for b in k_buffer] + [b.data_ptr() for b in v_buffer]
+    lens = [b.nbytes for b in k_buffer] + [b.nbytes for b in v_buffer]
+    item_lens = [b[0].nbytes * page_size for b in k_buffer] + [
+        b[0].nbytes * page_size for b in v_buffer
+    ]
+    return ptrs, lens, item_lens
+
+
 def make_mha_pool(
     device: torch.device = DEFAULT_DEVICE,
     *,
@@ -53,10 +97,49 @@ def make_mha_pool(
     return FakeMHAPool(layer_num=layer_num, k_buffer=k_layers, v_buffer=v_layers)
 
 
+def make_swa_pool(
+    device: torch.device = DEFAULT_DEVICE,
+    *,
+    full_slots: int = 16,
+    swa_slots: int = 8,
+    dim: int = 8,
+    layer_num: int = 1,
+) -> FakeSWAPool:
+    full = FakeSwaSubPool(
+        k_buffer=[
+            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+        v_buffer=[
+            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+    )
+    swa = FakeSwaSubPool(
+        k_buffer=[
+            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+        v_buffer=[
+            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+    )
+    lut = torch.full((full_slots + 1,), -1, dtype=torch.int64, device=device)
+    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int64, device=device)
+    return FakeSWAPool(
+        full_kv_pool=full, swa_kv_pool=swa, full_to_swa_index_mapping=lut
+    )
+
+
 def make_base_config() -> CanaryConfig:
     return CanaryConfig(
         mode=CanaryMode.RAISE,
         ring_capacity=1024,
+        sweep_interval=0,
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
+        enable_write_input_assert=False,
+        enable_verify_token_assert=True,
     )
 
 
@@ -143,6 +226,8 @@ def make_buffer_group(
     device: torch.device = DEFAULT_DEVICE,
     kind: PoolKind = PoolKind.FULL,
     has_v: bool = True,
+    has_real_kv: bool = False,
+    real_kv_source: Optional[RealKvSource] = None,
     swa_index_lut: Optional[torch.Tensor] = None,
     num_slots: int = 4,
     kv_token_id_vs_position_offset: int = 0,
@@ -152,12 +237,25 @@ def make_buffer_group(
             num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
         )
 
+    if has_real_kv:
+        source = real_kv_source or RealKvSource(
+            tensor=torch.zeros(num_slots, 16, dtype=torch.uint8, device=device),
+            page_size=1,
+            num_bytes_per_token=16,
+            read_bytes=16,
+        )
+        real_kv_sources = (source,)
+    else:
+        real_kv_sources = ()
+
     return CanaryBufferGroup(
         kind=kind,
         k_head=_zero(),
         k_tail=_zero(),
         v_head=_zero() if has_v else None,
         v_tail=_zero() if has_v else None,
+        real_kv_sources_k=real_kv_sources,
+        real_kv_sources_v=real_kv_sources if has_v else (),
         swa_index_lut=swa_index_lut,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
@@ -189,3 +287,4 @@ def make_radix_cache(
 
 
 register_pool_attacher(FakeMHAPool, attach_mha)
+register_pool_attacher(FakeSWAPool, attach_swa)
