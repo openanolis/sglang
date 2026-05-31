@@ -237,6 +237,8 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -746,6 +748,12 @@ class Envs:
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+
+    # ===================================================================
+    # KV-Canary (testing-only)
+    # ===================================================================
+    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
 
 envs = Envs()
