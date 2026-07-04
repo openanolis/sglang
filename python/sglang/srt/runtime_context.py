@@ -290,6 +290,10 @@ class AttnFlags(_StaticFlags):
 class MoeFlags(_StaticFlags):
     """MoE-family resolved flags (leaves arrive with the V3 sweeps)."""
 
+    # Resolved MoE runner backend; the pristine user request stays on
+    # server_args.moe_runner_backend.
+    runner_backend: str = "auto"
+
 
 @dataclasses.dataclass
 class CaptureFlags(_FlagGroupBase):
@@ -319,6 +323,16 @@ class Flags(_StaticFlags):
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     sampling_backend: str | None = None
+    page_size: int | None = None
+    quantization: str | None = None
+    # Parallel-request fields: flat transitional home, to be re-homed by the
+    # Parallel Parameters Clarification module.
+    enable_dp_attention: bool = False
+    enable_dp_lm_head: bool = False
+    moe_a2a_backend: str = "none"
+    ep_size: int = 1
+    moe_dense_tp_size: int | None = None
+    attn_cp_size: int = 1
 
     def freeze(self) -> None:
         for field in dataclasses.fields(self):
@@ -334,6 +348,7 @@ class Flags(_StaticFlags):
 # family as readers migrate.
 FLAG_LEAF_MAP: dict[str, str] = {
     "attention_backend": "attn.backend",
+    "moe_runner_backend": "moe.runner_backend",
 }
 
 

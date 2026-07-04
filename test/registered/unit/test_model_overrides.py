@@ -16,7 +16,7 @@ from typing import Optional
 from unittest.mock import patch
 
 from sglang.srt.arg_groups import overrides as overrides_module
-from sglang.srt.arg_groups.arg_utils import A, Arg, model_overridable_fields
+from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.overrides import (
     OverrideRecord,
     apply_declarations_to_server_args,
@@ -37,18 +37,18 @@ from sglang.test.test_utils import CustomTestCase
 @dataclasses.dataclass
 class _FakeArgs:
     plain: A[int, "help text only"] = 0
-    resolved_by_model: A[str, Arg(help="x", model_overridable=True)] = "auto"
-    also_resolved: A[Optional[int], Arg(help="y", model_overridable=True)] = None
+    resolved_by_model: A[str, Arg(help="x", resolvable=True)] = "auto"
+    also_resolved: A[Optional[int], Arg(help="y", resolvable=True)] = None
     metadata_but_not_overridable: A[bool, Arg(help="z")] = False
 
 
 class TestModelOverridableWhitelist(CustomTestCase):
     def test_arg_defaults_to_not_overridable(self):
-        self.assertFalse(Arg().model_overridable)
+        self.assertFalse(Arg().resolvable)
 
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(
-            model_overridable_fields(_FakeArgs),
+            resolvable_fields(_FakeArgs),
             frozenset({"resolved_by_model", "also_resolved"}),
         )
 
@@ -59,7 +59,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
         from sglang.srt.server_args import ServerArgs
 
         self.assertEqual(
-            model_overridable_fields(ServerArgs),
+            resolvable_fields(ServerArgs),
             frozenset(
                 {
                     "dtype",
@@ -69,12 +69,21 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
                     "attention_backend",
+                    "page_size",
+                    "moe_runner_backend",
+                    "quantization",
+                    "enable_dp_attention",
+                    "enable_dp_lm_head",
+                    "moe_a2a_backend",
+                    "ep_size",
+                    "moe_dense_tp_size",
+                    "attn_cp_size",
                 }
             ),
         )
 
     def test_non_dataclass_yields_empty_whitelist(self):
-        self.assertEqual(model_overridable_fields(SimpleNamespace), frozenset())
+        self.assertEqual(resolvable_fields(SimpleNamespace), frozenset())
 
 
 class _IsolatedRegistry(CustomTestCase):
@@ -742,6 +751,271 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _dllm_attention_backend(_view(dllm_algorithm=None)), {}
                 )
 
+    def test_page_size_default_pass(self):
+        from sglang.srt.arg_groups.overrides import ResolvedView, _page_size_default
+
+        # user-set page_size: nothing to declare
+        self.assertEqual(
+            _page_size_default(ResolvedView(SimpleNamespace(page_size=64))), {}
+        )
+        # default fill on non-HIP/non-MUSA platforms is 1
+        with patch.object(overrides_module, "is_hip", return_value=False):
+            with patch.object(overrides_module, "is_musa", return_value=False):
+                self.assertEqual(
+                    _page_size_default(ResolvedView(SimpleNamespace(page_size=None))),
+                    {"page_size": 1},
+                )
+            with patch.object(overrides_module, "is_musa", return_value=True):
+                self.assertEqual(
+                    _page_size_default(ResolvedView(SimpleNamespace(page_size=None))),
+                    {"page_size": 64},
+                )
+
+    def test_dllm_page_size_pass(self):
+        from sglang.srt.arg_groups.overrides import ResolvedView, _dllm_page_size
+
+        def _view(**kw):
+            defaults = dict(
+                dllm_algorithm="LowConfidence", disable_radix_cache=False, page_size=1
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch(
+            "sglang.srt.dllm.config.DllmConfig.from_server_args",
+            return_value=SimpleNamespace(block_size=32),
+        ):
+            self.assertEqual(_view() and _dllm_page_size(_view()), {"page_size": 32})
+            self.assertEqual(_dllm_page_size(_view(page_size=64)), {})  # aligned
+        self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
+        self.assertEqual(_dllm_page_size(_view(disable_radix_cache=True)), {})
+
+    def test_page_size_leaf_materializes_end_state(self):
+        sa = self._construct("LlamaForCausalLM", "llama")
+        declared = {f for _s, d in sa._resolved_overrides for f in d}
+        self.assertIn("page_size", declared)  # default fill declared
+        self.assertEqual(self._publish(sa).page_size, sa.page_size)
+
+    def test_qwen3_5_hybrid_coupled_declaration(self):
+        from sglang.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
+
+        def _args(default_backend, **kw):
+            defaults = dict(
+                attention_backend=None,
+                _get_default_attn_backend=lambda **_: default_backend,
+                use_mla_backend=lambda: False,
+                get_model_config=lambda: None,
+                enable_mamba_extra_buffer=lambda: False,
+                disable_radix_cache=False,
+                speculative_algorithm=None,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            # radix on + no extra buffer + no spec -> page_size=1 path
+            self.assertEqual(
+                _qwen3_5_hybrid_overrides(_args("trtllm_mha"), None),
+                {"attention_backend": "triton", "page_size": 1},
+            )
+            # spec decoding present -> trtllm_mha + page 64 (coupled)
+            self.assertEqual(
+                _qwen3_5_hybrid_overrides(
+                    _args("trtllm_mha", speculative_algorithm="EAGLE"), None
+                ),
+                {"attention_backend": "trtllm_mha", "page_size": 64},
+            )
+            # user-set backend: nothing declared
+            self.assertEqual(
+                _qwen3_5_hybrid_overrides(
+                    _args("trtllm_mha", attention_backend="fa3"), None
+                ),
+                {},
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(_qwen3_5_hybrid_overrides(_args("fa3"), None), {})
+
+    def test_qwen3vl_page_size(self):
+        from sglang.srt.arg_groups.overrides import _qwen3vl_overrides
+
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            with patch("sglang.srt.environ.envs.SGLANG_USE_AITER_UNIFIED_ATTN") as e:
+                e.get.return_value = True
+                self.assertEqual(
+                    _qwen3vl_overrides(SimpleNamespace(page_size=None), None),
+                    {"page_size": 16},
+                )
+                self.assertEqual(
+                    _qwen3vl_overrides(SimpleNamespace(page_size=64), None), {}
+                )
+
+    def test_moe_runner_quant_constraint_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _moe_runner_backend_quant_constraints,
+        )
+
+        def _view(**kw):
+            defaults = dict(quantization=None, moe_runner_backend="auto")
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="nvfp4_online")
+                ),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            with self.assertRaises(ValueError):  # incompatible explicit backend
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="nvfp4_online", moe_runner_backend="triton")
+                )
+        self.assertEqual(
+            _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
+            {"moe_runner_backend": "flashinfer_trtllm"},
+        )
+        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="modelopt_fp4")
+                ),
+                {"moe_runner_backend": "flashinfer_cutlass"},
+            )
+        self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
+
+    def test_cutlass_moe_env_override_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _cutlass_moe_env_override,
+        )
+
+        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
+            e.get.return_value = True
+            self.assertEqual(
+                _cutlass_moe_env_override(
+                    ResolvedView(SimpleNamespace(quantization="fp8"))
+                ),
+                {"moe_runner_backend": "cutlass"},
+            )
+            with self.assertRaises(AssertionError):
+                _cutlass_moe_env_override(
+                    ResolvedView(SimpleNamespace(quantization=None))
+                )
+            e.get.return_value = False
+            self.assertEqual(
+                _cutlass_moe_env_override(ResolvedView(SimpleNamespace())), {}
+            )
+
+    def test_gguf_quantization_pass(self):
+        from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
+
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.check_gguf_file",
+            return_value=True,
+        ):
+            self.assertEqual(
+                _gguf_quantization(
+                    ResolvedView(
+                        SimpleNamespace(load_format="auto", model_path="x.gguf")
+                    )
+                ),
+                {"quantization": "gguf"},
+            )
+            self.assertEqual(
+                _gguf_quantization(
+                    ResolvedView(
+                        SimpleNamespace(load_format="safetensors", model_path="x")
+                    )
+                ),
+                {},
+            )
+
+    def test_page_constraint_passes_at_callable_level(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _fa4_page_constraint,
+            _intel_xpu_page_constraint,
+            _mla_backend_page_constraints,
+        )
+
+        def _view(**kw):
+            defaults = dict(
+                attention_backend=None,
+                decode_attention_backend=None,
+                prefill_attention_backend=None,
+                page_size=1,
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        # flashmla snaps to 64 (unconditional within the backend match)
+        self.assertEqual(
+            _mla_backend_page_constraints(_view(attention_backend="flashmla")),
+            {"page_size": 64},
+        )
+        # trtllm_mla with already-valid page: no declaration
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(attention_backend="trtllm_mla", page_size=32)
+            ),
+            {},
+        )
+        # chained: flashmla via decode -> 64, then trtllm_mha accepts 64
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(
+                    decode_attention_backend="flashmla",
+                    prefill_attention_backend="trtllm_mha",
+                )
+            ),
+            {"page_size": 64},
+        )
+        # no matching backend: nothing declared
+        self.assertEqual(_mla_backend_page_constraints(_view()), {})
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _fa4_page_constraint(
+                    _view(
+                        attention_backend="fa4",
+                        use_mla_backend=lambda: False,
+                        speculative_eagle_topk=None,
+                    )
+                ),
+                {"page_size": 128},
+            )
+            self.assertEqual(
+                _fa4_page_constraint(
+                    _view(
+                        attention_backend="fa4",
+                        use_mla_backend=lambda: False,
+                        speculative_eagle_topk=2,  # EAGLE topk>1 keeps default
+                    )
+                ),
+                {},
+            )
+
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    get_attention_backends=lambda: (None, "intel_xpu"),
+                    use_mla_backend=lambda: False,
+                )
+            ),
+            {"page_size": 128},
+        )
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    get_attention_backends=lambda: (None, "intel_xpu"),
+                    use_mla_backend=lambda: True,
+                    page_size=16,  # MLA decode accepts 16
+                )
+            ),
+            {},
+        )
+
     def test_monolith_attention_families_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
             _falcon_h1_jet_overrides,
@@ -758,6 +1032,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 device="cuda",
                 attention_backend=None,
                 is_attention_backend_not_set=lambda: True,
+                # keep the (now-absorbed) quant/moe blocks inert so these
+                # assertions stay attention-only
+                moe_runner_backend="triton",
+                quantization=None,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -805,9 +1083,249 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _gemma4_overrides(_args(), None), {"attention_backend": "triton"}
             )
-        # Glm4Moe: unconditional tf32 declaration (quant/moe writes stay in
-        # the branch until their field chains migrate)
-        self.assertEqual(_glm4_moe_overrides(None, None), {"enable_tf32_matmul": True})
+        # Glm4Moe: unconditional tf32 declaration + (sm100) quant/moe absorption
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(
+                _glm4_moe_overrides(None, None), {"enable_tf32_matmul": True}
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _glm4_moe_overrides(
+                    SimpleNamespace(
+                        quantization=None,
+                        _quantization_explicitly_unset=False,
+                        moe_a2a_backend="none",
+                        moe_runner_backend="auto",
+                    ),
+                    SimpleNamespace(
+                        quantization_config={"quant_method": "modelopt_fp4"}
+                    ),
+                ),
+                {
+                    "quantization": "modelopt_fp4",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                    "enable_tf32_matmul": True,
+                },
+            )
+
+    def test_deepseek_moe_quant_slot_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_moe_quant_resolution,
+        )
+
+        def _view(arch="DeepseekV32ForCausalLM", quant_cfg=None, **kw):
+            defaults = dict(
+                quantization=None,
+                _quantization_explicitly_unset=False,
+                moe_a2a_backend="none",
+                moe_runner_backend="auto",
+                get_model_config=lambda: SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[arch], quantization_config=quant_cfg
+                    )
+                ),
+            )
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            with patch.object(
+                overrides_module, "get_quantization_config", return_value="fp8"
+            ):
+                # config-declared quant: detected + moe runner
+                self.assertEqual(
+                    _deepseek_moe_quant_resolution(_view()),
+                    {
+                        "quantization": "fp8",
+                        "moe_runner_backend": "flashinfer_trtllm",
+                    },
+                )
+            # non-deepseek arch guard (end-state list execution safety)
+            self.assertEqual(
+                _deepseek_moe_quant_resolution(_view(arch="LlamaForCausalLM")), {}
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(_deepseek_moe_quant_resolution(_view()), {})
+
+    def test_data_parallelism_and_a2a_passes(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _a2a_backend_overrides,
+            _a2a_ep_size,
+            _data_parallelism_defaults,
+        )
+
+        self.assertEqual(
+            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=1))),
+            {"enable_dp_attention": False, "enable_dp_lm_head": False},
+        )
+        self.assertEqual(
+            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=2))), {}
+        )
+
+        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
+            e.get.return_value = False
+            self.assertEqual(
+                _a2a_backend_overrides(
+                    ResolvedView(
+                        SimpleNamespace(
+                            enable_deepep_waterfill=True, moe_a2a_backend="none"
+                        )
+                    )
+                ),
+                {"moe_a2a_backend": "deepep"},
+            )
+            e.get.return_value = True
+            # megamoe env wins over the waterfill override (chained, last write)
+            self.assertEqual(
+                _a2a_backend_overrides(
+                    ResolvedView(
+                        SimpleNamespace(
+                            enable_deepep_waterfill=True, moe_a2a_backend="none"
+                        )
+                    )
+                ),
+                {"moe_a2a_backend": "megamoe"},
+            )
+
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(SimpleNamespace(moe_a2a_backend="deepep", tp_size=8))
+            ),
+            {"ep_size": 8},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))
+            ),
+            {},
+        )
+
+    def test_deepseek_family_order_safe_declarations(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+
+        def _args(**kw):
+            defaults = dict(
+                is_attention_backend_not_set=lambda: True,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                enable_prefill_cp=False,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        # DSA path on CUDA: dsa fill + page 64
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            with patch.object(overrides_module, "is_npu", return_value=False):
+                with patch.object(overrides_module, "is_xpu", return_value=False):
+                    with patch.object(overrides_module, "is_hip", return_value=False):
+                        self.assertEqual(
+                            _deepseek_family_overrides(_args(), None),
+                            {"attention_backend": "dsa", "page_size": 64},
+                        )
+                    # HIP without the preshuffle path: page 1
+                    with patch.object(overrides_module, "is_hip", return_value=True):
+                        with patch(
+                            "sglang.srt.layers.attention.dsa.utils.aiter_can_use_preshuffle_paged_mqa",
+                            return_value=False,
+                        ):
+                            self.assertEqual(
+                                _deepseek_family_overrides(_args(), None),
+                                {"attention_backend": "dsa", "page_size": 1},
+                            )
+        # DSA CP (zigzag): the coupled parallel-field declaration
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            with patch.object(overrides_module, "is_npu", return_value=False):
+                with patch.object(overrides_module, "is_xpu", return_value=False):
+                    with patch.object(overrides_module, "is_hip", return_value=False):
+                        result = _deepseek_family_overrides(
+                            _args(
+                                enable_prefill_cp=True,
+                                cp_strategy="zigzag",
+                                tp_size=8,
+                                dp_size=1,
+                                ep_size=1,
+                                moe_a2a_backend="none",
+                                kv_cache_dtype="auto",
+                            ),
+                            None,
+                        )
+                        self.assertEqual(
+                            result,
+                            {
+                                "attention_backend": "dsa",
+                                "page_size": 64,
+                                "enable_dp_attention": True,
+                                "moe_dense_tp_size": 1,
+                                "moe_a2a_backend": "deepep",
+                                "ep_size": 8,
+                                "attn_cp_size": 8,
+                            },
+                        )
+                        # interleave CP with dp>1 must assert
+                        with self.assertRaises(AssertionError):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=8,
+                                    dp_size=2,
+                                ),
+                                None,
+                            )
+
+        # MLA path on sm100: trtllm_mla fill (all three backends unset)
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False
+        ):
+            with patch.object(
+                overrides_module, "is_sm100_supported", return_value=True
+            ):
+                self.assertEqual(
+                    _deepseek_family_overrides(_args(), None),
+                    {"attention_backend": "trtllm_mla"},
+                )
+                self.assertEqual(
+                    _deepseek_family_overrides(
+                        _args(decode_attention_backend="fa3"), None
+                    ),
+                    {},
+                )
+            with patch.object(
+                overrides_module, "is_sm100_supported", return_value=False
+            ):
+                self.assertEqual(_deepseek_family_overrides(_args(), None), {})
+
+    def test_qwen3_moe_family_quant_absorption(self):
+        from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            with patch.object(
+                overrides_module, "get_quantization_config", return_value="fp8"
+            ):
+                self.assertEqual(
+                    _qwen3_moe_family_overrides(
+                        SimpleNamespace(
+                            quantization=None,
+                            _quantization_explicitly_unset=False,
+                            moe_a2a_backend="none",
+                            moe_runner_backend="auto",
+                        ),
+                        SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+                    ),
+                    {
+                        "quantization": "fp8",
+                        "moe_runner_backend": "flashinfer_trtllm",
+                    },
+                )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
