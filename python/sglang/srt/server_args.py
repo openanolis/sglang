@@ -93,7 +93,6 @@ from sglang.srt.utils.common import (
     nullable_str,
     parse_connector_type,
     torch_release,
-    xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -572,6 +571,7 @@ class ServerArgs:
                 '* "float32" for FP32 precision.'
             ),
             choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+            model_overridable=True,
         ),
     ] = "auto"
     quantization: A[
@@ -653,7 +653,10 @@ class ServerArgs:
     ] = None  # For flash_rl load format
     enable_tf32_matmul: A[
         bool,
-        "Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+        Arg(
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            model_overridable=True,
+        ),
     ] = False
 
     # -------------------------------------------------------------------------
@@ -750,14 +753,20 @@ class ServerArgs:
     page_size: A[Optional[int], "The number of tokens in a page."] = None
     swa_full_tokens_ratio: A[
         float,
-        (
-            "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
-            "of the number of swa:full layers. It should be between 0 and 1. "
-            "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
-            "layer has 100 tokens."
+        Arg(
+            help=(
+                "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
+                "of the number of swa:full layers. It should be between 0 and 1. "
+                "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
+                "layer has 100 tokens."
+            ),
+            model_overridable=True,
         ),
     ] = 0.8
-    disable_hybrid_swa_memory: A[bool, "Disable the hybrid SWA memory pool."] = False
+    disable_hybrid_swa_memory: A[
+        bool,
+        Arg(help="Disable the hybrid SWA memory pool.", model_overridable=True),
+    ] = False
     radix_eviction_policy: A[
         str,
         Arg(
@@ -1399,6 +1408,7 @@ class ServerArgs:
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
+            model_overridable=True,
         ),
     ] = None
     decode_attention_backend: A[
@@ -1420,6 +1430,7 @@ class ServerArgs:
         Arg(
             help="Choose the kernels for sampling layers.",
             choices=SAMPLING_BACKEND_CHOICES,
+            model_overridable=True,
         ),
     ] = None
     grammar_backend: A[
@@ -1595,7 +1606,10 @@ class ServerArgs:
     ] = False
     enable_multi_layer_eagle: A[
         bool,
-        "Enable multi-layer Eagle speculative decoding.",
+        Arg(
+            help="Enable multi-layer Eagle speculative decoding.",
+            model_overridable=True,
+        ),
     ] = False
     speculative_adaptive: A[
         bool,
@@ -2568,6 +2582,12 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        # Declaration stash for the override/post-process passes. Set before any
+        # short-circuit (none/dummy model paths) so run_post_process_pass and
+        # direct handler invocations can rely on it even when
+        # _handle_model_specific_adjustments never runs.
+        self._resolved_overrides = []
 
         self._maybe_download_model_for_runai()
 
@@ -3709,6 +3729,7 @@ class ServerArgs:
 
         self.uses_mamba_radix_cache = False
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            self._resolved_overrides = []
             return
 
         hf_config = self.get_model_config().hf_config
@@ -3718,11 +3739,21 @@ class ServerArgs:
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
-        if model_arch in [
-            "MistralLarge3ForCausalLM",
-            "PixtralForConditionalGeneration",
-        ]:
-            self.dtype = "bfloat16"
+        # Collect the declarative model overrides (registry) on the
+        # pristine config and stash them for publish-time flags resolution.
+        # Transition dual-apply: the same declarations are applied to
+        # server_args right here, byte-identical to the imperative arch
+        # branches this dispatch gradually replaces (dual-apply is retired
+        # per field once that field's readers migrate to the flags tier).
+        from sglang.srt.arg_groups.overrides import (
+            apply_declarations_to_server_args,
+            collect_model_override_declarations,
+        )
+
+        self._resolved_overrides = collect_model_override_declarations(
+            model_arch, self, hf_config
+        )
+        apply_declarations_to_server_args(self, self._resolved_overrides)
 
         if model_arch in [
             "DeepseekV4ForCausalLM",
@@ -4028,32 +4059,8 @@ class ServerArgs:
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
         elif model_arch in ["GptOssForCausalLM"]:
-            # Set attention backend for GPT-OSS
-            if self.is_attention_backend_not_set():
-                if is_sm100_supported():
-                    self.attention_backend = "trtllm_mha"
-                elif is_sm90_supported():
-                    self.attention_backend = "fa3"
-                elif is_cpu() and cpu_has_amx_support():
-                    self.attention_backend = "intel_amx"
-                elif is_xpu():
-                    self.attention_backend = "intel_xpu"
-                elif is_hip():
-                    self.attention_backend = "aiter"
-                else:
-                    self.attention_backend = "triton"
-
-            if is_xpu():
-                # Check for bf16 dtype on Intel XPU
-                if self.dtype == "auto":
-                    logger.warning(
-                        "GptOssForCausalLM on Intel XPU currently supports bfloat16 dtype only"
-                    )
-                elif self.dtype not in ["bfloat16"]:
-                    raise NotImplementedError(
-                        f"GptOssForCausalLM on Intel XPU only supports bfloat16 dtype, "
-                        f"but got '{self.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto."
-                    )
+            # Attention backend selection + XPU dtype validation moved to the
+            # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
 
             supported_backends = [
                 "triton",
@@ -4086,9 +4093,8 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
-            if is_mxfp4_quant_format:
-                # use bf16 for mxfp4 triton kernels
-                self.dtype = "bfloat16"
+            # The mxfp4 dtype override moved to the override registry
+            # (arg_groups/overrides.py: _gpt_oss_overrides).
 
             if self.moe_runner_backend == "auto":
                 if is_sm100_supported() and is_mxfp4_quant_format:
@@ -4182,11 +4188,8 @@ class ServerArgs:
                         f"attention TP size is {expected_attn_tp_size}."
                     )
 
-            if self.speculative_algorithm == "EAGLE":
-                self.enable_multi_layer_eagle = True
-                logger.info(
-                    "Enable multi-layer EAGLE speculative decoding for MiMoV2 model."
-                )
+            # enable_multi_layer_eagle for EAGLE moved to the override registry
+            # (arg_groups/overrides.py: _mimo_v2_overrides).
 
             if self.enable_hierarchical_cache:
                 if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
@@ -4203,47 +4206,13 @@ class ServerArgs:
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
         ):
-            if self.is_attention_backend_not_set():
-                if is_blackwell_supported():
-                    self.attention_backend = "fa4"
-                    logger.info(
-                        "Auto-select fa4 attention backend for Step3p7 on Blackwell."
-                    )
-                elif is_sm90_supported():
-                    self.attention_backend = "fa3"
-                    logger.info(
-                        "Auto-select fa3 attention backend for Step3p7 on Hopper."
-                    )
-            if self.speculative_algorithm == "EAGLE":
-                self.enable_multi_layer_eagle = True
-                logger.info(
-                    "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
-                )
-            if self.enable_hierarchical_cache:
-                self.swa_full_tokens_ratio = 1.0
-                logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for Step3p5ForCausalLM model with hierarchical cache"
-                )
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
-                )
+            # Attention backend selection + EAGLE multi-layer +
+            # hierarchical-cache SWA writes moved to the override registry
+            # (arg_groups/overrides.py: _step3p_overrides).
+            pass
         elif model_arch in LLAMA4_MODEL_ARCHS and self.device != "cpu":
-            # Auto-select attention backend for Llama4 if not specified
-            if self.attention_backend is None:
-                if is_sm100_supported():
-                    self.attention_backend, platform = "trtllm_mha", "sm100"
-                elif is_sm90_supported():
-                    self.attention_backend, platform = "fa3", "sm90"
-                elif is_hip():
-                    self.attention_backend, platform = "aiter", "hip"
-                elif self.device == "xpu":
-                    self.attention_backend, platform = "intel_xpu", "xpu"
-                else:
-                    self.attention_backend, platform = "triton", "other platforms"
-                logger.warning(
-                    f"Use {self.attention_backend} as attention backend on {platform} for Llama4 model"
-                )
+            # Attention backend auto-select moved to the override registry
+            # (arg_groups/overrides.py: _llama4_overrides).
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
@@ -4258,39 +4227,15 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
                     )
-        elif model_arch in [
-            "Gemma2ForCausalLM",
-            "Gemma3ForCausalLM",
-            "Gemma3ForConditionalGeneration",
-            "Gemma3nForCausalLM",
-            "Gemma3nForConditionalGeneration",
-        ]:
-            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
-            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning(
-                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
-            )
-            self.disable_hybrid_swa_memory = True
+        # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
+        # (arg_groups/overrides.py: _gemma2_gemma3_overrides).
         elif model_arch in (
             "Gemma4ForConditionalGeneration",
             "Gemma4ForCausalLM",
             "Gemma4UnifiedForConditionalGeneration",
         ):
-            default_attention_backend = (
-                "trtllm_mha" if is_sm100_supported() else "triton"
-            )
-            if self.is_attention_backend_not_set():
-                self.attention_backend = default_attention_backend
-                logger.info(
-                    f"Use {self.attention_backend} as default attention backend for Gemma4"
-                )
-            else:
-                # If only one split backend is set, keep the other side on a
-                # Gemma4-compatible fallback instead of letting generic backend
-                # selection choose an unsupported backend later.
-                if self.attention_backend is None:
-                    self.attention_backend = default_attention_backend
-
+            # Default attention backend selection moved to the override registry
+            # (arg_groups/overrides.py: _gemma4_overrides).
             prefill_backend, decode_backend = self.get_attention_backends()
             accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
             assert (
@@ -4322,29 +4267,16 @@ class ServerArgs:
             )
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
-                logger.warning(
-                    f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
-                )
-                self.disable_hybrid_swa_memory = True
+                # disable_hybrid_swa_memory moved to the override registry
+                # (arg_groups/overrides.py: _exaone_overrides).
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
                 accepted_backends = ["fa3", "triton", "trtllm_mha"]
                 assert (
                     self.attention_backend in accepted_backends
                 ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
-            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
-            logger.warning(
-                f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
-            )
-            self.disable_hybrid_swa_memory = True
-
-            if self.attention_backend is None:
-                if is_cuda() and is_sm100_supported():
-                    self.attention_backend = "trtllm_mha"
-                elif is_cuda() and get_device_sm() >= 80:
-                    self.attention_backend = "fa3"
-                else:
-                    self.attention_backend = "triton"
+            # disable_hybrid_swa_memory + attention backend selection moved to
+            # the override registry (arg_groups/overrides.py: _olmo2_overrides).
 
             # Flashinfer appears to degrade performance when sliding window attention
             # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
@@ -4431,8 +4363,8 @@ class ServerArgs:
         elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
             # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
             # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
-            if is_sm100_supported() and self.attention_backend is None:
-                self.attention_backend = "triton"
+            # (attention backend selection moved to the override registry:
+            # arg_groups/overrides.py _minicpm_v4_6_overrides)
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
@@ -4458,18 +4390,16 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                     )
-            self.enable_tf32_matmul = True
-            logger.info(
-                "Enable TF32 matmul for Glm4MoeForCausalLM model to improve gate gemm performance."
-            )
+            # enable_tf32_matmul moved to the override registry
+            # (arg_groups/overrides.py: _glm4_moe_overrides).
 
         elif model_arch in [
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
-            if is_sm100_supported() and self.attention_backend is None:
-                self.attention_backend = "triton"
+            # Attention backend selection moved to the override registry
+            # (arg_groups/overrides.py: _falcon_h1_jet_overrides).
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch == "GraniteMoeHybridForCausalLM":
@@ -4479,13 +4409,13 @@ class ServerArgs:
                 for layer_type in getattr(hf_config, "layer_types", [])
             )
             if has_mamba:
-                if is_sm100_supported() and self.attention_backend is None:
-                    self.attention_backend = "flashinfer"
+                # Attention backend selection moved to the override registry
+                # (arg_groups/overrides.py: _granite_moe_hybrid_overrides).
                 self._handle_mamba_radix_cache(model_arch=model_arch)
 
         elif model_arch in ["Lfm2ForCausalLM"]:
-            if is_sm100_supported() and self.attention_backend is None:
-                self.attention_backend = "flashinfer"
+            # Attention backend selection moved to the override registry
+            # (arg_groups/overrides.py: _lfm2_overrides).
             self._handle_mamba_radix_cache(model_arch=model_arch)
             assert self.attention_backend != "triton", (
                 f"{model_arch} does not support triton attention backend, "
@@ -4495,11 +4425,8 @@ class ServerArgs:
         elif model_arch in ["ZayaForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
-        elif model_arch in ["MiniMaxM2ForCausalLM"]:
-            self.enable_tf32_matmul = True
-            logger.info(
-                "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
-            )
+        # MiniMaxM2ForCausalLM (enable_tf32_matmul) moved to the override registry
+        # (arg_groups/overrides.py: _minimax_m2_overrides).
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
@@ -4626,10 +4553,14 @@ class ServerArgs:
             self._validate_mamba_no_buffer(model_arch)
 
     def _handle_sampling_backend(self):
-        if self.sampling_backend is None:
-            self.sampling_backend = (
-                "flashinfer" if is_flashinfer_available() else "pytorch"
-            )
+        # Moved to the resolution pipeline (arg_groups/overrides.py:
+        # _sampling_backend_default), invoked here at its legacy slot.
+        from sglang.srt.arg_groups.overrides import (
+            _sampling_backend_default,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(self, _sampling_backend_default)
 
     def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
         """
@@ -4700,22 +4631,20 @@ class ServerArgs:
 
     def _handle_attention_backend_compatibility(self):
         model_config = self.get_model_config()
-        use_mla_backend = self.use_mla_backend()
 
-        if self.prefill_attention_backend is not None and (
-            self.prefill_attention_backend == self.decode_attention_backend
-        ):  # override the default attention backend
-            self.attention_backend = self.prefill_attention_backend
+        # The attention_backend write clusters of this handler moved to the
+        # resolution pipeline (arg_groups/overrides.py), each invoked below at
+        # its legacy slot; the interleaved non-attention adjustments stay.
+        from sglang.srt.arg_groups.overrides import (
+            _attention_backend_default,
+            _attention_backend_dual_chunk,
+            _attention_backend_fa3_fp8_fallback,
+            _attention_backend_platform_fallbacks,
+            run_post_process_pass,
+        )
 
-        # Pick the default attention backend if not specified
-        if self.attention_backend is None:
-            self.attention_backend = self._get_default_attn_backend(
-                use_mla_backend, model_config
-            )
-
-            logger.info(
-                f"Attention backend not specified. Use {self.attention_backend} backend by default."
-            )
+        # Split-backend override + default fill.
+        run_post_process_pass(self, _attention_backend_default)
 
         # Torch native and flex attention backends
         if self.attention_backend == "torch_native":
@@ -4868,12 +4797,7 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-        if self.attention_backend == "fa3" and self.kv_cache_dtype == "fp8_e5m2":
-            logger.warning(
-                "FlashAttention3 only supports fp8_e4m3 if using FP8; "
-                "Setting attention backend to triton."
-            )
-            self.attention_backend = "triton"
+        run_post_process_pass(self, _attention_backend_fa3_fp8_fallback)
 
         if (
             (
@@ -4899,25 +4823,7 @@ class ServerArgs:
                 self.mem_fraction_static *= 0.85
 
         # Other platforms backends
-        if (
-            self.attention_backend == "intel_amx"
-            and self.device == "cpu"
-            and not cpu_has_amx_support()
-        ):
-            logger.warning(
-                "The current platform does not support Intel AMX, will fallback to torch_native backend."
-            )
-            self.attention_backend = "torch_native"
-
-        if (
-            self.attention_backend == "intel_xpu"
-            and self.device == "xpu"
-            and not xpu_has_xmx_support()
-        ):
-            logger.warning(
-                "The current platform does not support Intel XMX, will fallback to triton backend."
-            )
-            self.attention_backend = "triton"
+        run_post_process_pass(self, _attention_backend_platform_fallbacks)
 
         prefill_backend, decode_backend = self.get_attention_backends()
         if self.use_mla_backend() and prefill_backend == "intel_xpu":
@@ -4940,18 +4846,7 @@ class ServerArgs:
                 self.page_size = 128
 
         # Dual chunk flash attention backend
-        if (
-            getattr(model_config.hf_config, "dual_chunk_attention_config", None)
-            is not None
-        ):
-            if self.attention_backend is None:
-                self.attention_backend = "dual_chunk_flash_attn"
-                logger.info("Dual chunk attention is turned on by default.")
-            elif self.attention_backend != "dual_chunk_flash_attn":
-                raise ValueError(
-                    "Dual chunk attention is enabled, but attention backend is set to "
-                    f"{self.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
-                )
+        run_post_process_pass(self, _attention_backend_dual_chunk)
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
                 "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
@@ -6322,12 +6217,16 @@ class ServerArgs:
                 )
                 self.flashinfer_allreduce_fusion_backend = None
 
-            # Check sampling backend
-            if self.sampling_backend != "ascend":
-                self.sampling_backend = "pytorch"
-                logger.warning(
-                    "Sampling backend is set to pytorch for deterministic inference."
-                )
+            # The forced-pytorch sampling write and the attention backend
+            # fill/validation moved to the resolution pipeline
+            # (arg_groups/overrides.py), invoked at their legacy slots.
+            from sglang.srt.arg_groups.overrides import (
+                _deterministic_attention_backend,
+                _deterministic_sampling_backend,
+                run_post_process_pass,
+            )
+
+            run_post_process_pass(self, _deterministic_sampling_backend)
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
@@ -6345,29 +6244,7 @@ class ServerArgs:
                     pass
 
             # Check attention backend
-            if self.attention_backend is None:
-                # User didn't specify attention backend, fallback based on GPU architecture
-                if is_sm100_supported() or is_sm120_supported():
-                    # Blackwell and newer architectures
-                    if is_deepseek_model:
-                        # fallback to triton for DeepSeek models because flashinfer doesn't support deterministic inference for DeepSeek models yet
-                        self.attention_backend = "triton"
-                    else:
-                        # fallback to flashinfer on Blackwell for non-DeepSeek models
-                        self.attention_backend = "flashinfer"
-                else:
-                    # Hopper (SM90) and older architectures
-                    self.attention_backend = "fa3"
-                logger.warning(
-                    f"Attention backend not specified. Falling back to '{self.attention_backend}' for deterministic inference. "
-                    f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
-                )
-            elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
-                # User explicitly specified an incompatible attention backend
-                raise ValueError(
-                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
-                    f"but you explicitly specified '{self.attention_backend}'."
-                )
+            run_post_process_pass(self, _deterministic_attention_backend)
 
             if is_deepseek_model:
                 if self.attention_backend not in ["fa3", "triton"]:
@@ -6478,7 +6355,9 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
+        # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
+        # resolution moved to the pipeline: arg_groups/overrides.py
+        # _dllm_attention_backend, invoked below at its legacy slot).
         if is_hip():
             if (
                 self.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -6489,23 +6368,14 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            if self.attention_backend not in ["triton", "aiter"]:
-                logger.warning(
-                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
-                )
-                self.attention_backend = "triton"
-        elif is_npu():
-            if self.attention_backend != "ascend":
-                logger.warning(
-                    "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
-                )
-                self.attention_backend = "ascend"
-        elif self.cuda_graph_config.decode.backend != Backend.DISABLED:
-            if self.attention_backend != "flashinfer":
-                logger.warning(
-                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
-                )
-                self.attention_backend = "flashinfer"
+
+        from sglang.srt.arg_groups.overrides import (
+            _dllm_attention_backend,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(self, _dllm_attention_backend)
+
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"
@@ -7594,23 +7464,29 @@ class ServerArgs:
         }
 
 
-# NOTE: This is a global variable to hold the server args for scheduler.
-_global_server_args: Optional[ServerArgs] = None
-
-
+# NOTE: The process-wide ServerArgs is owned by the runtime context
+# (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
+# for the existing call-sites; they publish/read the same live object by
+# reference. Do not add new call-sites — the counts are ratcheted
+# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
+# Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    global _global_server_args
-    _global_server_args = server_args
+    """Legacy publish shim — prefer ``get_context().set_server_args()`` from
+    ``sglang.srt.runtime_context`` in new code."""
+    from sglang.srt.runtime_context import get_context
+
+    get_context().set_server_args(server_args)
 
 
 set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
-    if _global_server_args is None:
-        raise ValueError("Global server args is not set yet!")
+    """Legacy accessor shim — prefer ``get_server_args()`` from
+    ``sglang.srt.runtime_context`` in new code."""
+    from sglang.srt.runtime_context import get_context
 
-    return _global_server_args
+    return get_context().server_args
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
