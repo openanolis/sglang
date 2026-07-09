@@ -42,7 +42,6 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
-    get_attention_tp_group,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -73,7 +72,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -262,8 +261,6 @@ class AttentionInputs:
 class AttnTpContext:
     def __init__(self):
         self.allow_input_scattered = False
-        self.input_scattered_ = False
-        self.attn_inputs_: Optional[AttentionInputs] = None
         self.is_dsa = False
 
     def init_context(self, q_lora_rank, is_dsa):
@@ -299,30 +296,35 @@ class AttnTpContext:
 
     @property
     def input_scattered(self):
-        return self.input_scattered_
+        return get_forward().attn_input_scattered
 
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
-        self.attn_inputs_ = attn_inputs
+        get_forward().set("attn_inputs", attn_inputs)
 
     def fetch_qkv_latent(self):
-        assert self.attn_inputs_ is not None
-        return self.attn_inputs_.fetch_qkv_latent()
+        attn_inputs = get_forward().attn_inputs
+        assert attn_inputs is not None
+        return attn_inputs.fetch_qkv_latent()
 
     def fetch_hidden_states(self):
-        assert self.attn_inputs_ is not None
-        return self.attn_inputs_.fetch_hidden_states()
+        attn_inputs = get_forward().attn_inputs
+        assert attn_inputs is not None
+        return attn_inputs.fetch_hidden_states()
 
     def clear_attn_inputs(self) -> None:
-        self.attn_inputs_ = None
+        get_forward().set("attn_inputs", None)
 
     @contextmanager
     def maybe_input_scattered(self, forward_batch: ForwardBatch):
         flag = self.use_input_scattered(forward_batch)
-        old_flag = self.input_scattered
-        self.input_scattered_ = flag
-        yield
-        self.input_scattered_ = old_flag
-        self.attn_inputs_ = None
+        forward = get_forward()
+        # scoped() also restores when the forward raises — the old in-place
+        # swap leaked the flag on exceptions.
+        with forward.scoped(attn_input_scattered=flag):
+            try:
+                yield
+            finally:
+                forward.set("attn_inputs", None)
 
 
 ATTN_TP_CONTEXT = AttnTpContext()
@@ -920,7 +922,7 @@ class CommunicateSimpleFn:
             return tuple(gathered_hidden_states)
 
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
+            get_local_dp_buffer(get_parallel().attn_tp_group),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -1041,7 +1043,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         (``moe_dense_tp_size > 1``): both hidden states and residual stay in
         ``TP_ATTN_FULL`` across the boundary.
         """
-        hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+        hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
@@ -1066,7 +1068,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
-                get_local_dp_buffer(get_attention_tp_group()),
+                get_local_dp_buffer(get_parallel().attn_tp_group),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
@@ -1322,7 +1324,7 @@ class CommunicateSummableTensorPairFn:
         if get_parallel().tp_size == get_parallel().attn_dp_size:
             group = get_tp_group()
         else:
-            group = get_attention_tp_group()
+            group = get_parallel().attn_tp_group
         hidden_states, global_hidden_states = (
             get_local_dp_buffer(group),
             hidden_states,
@@ -1350,7 +1352,7 @@ class CommunicateSummableTensorPairFn:
         hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
+            get_local_dp_buffer(get_parallel().attn_tp_group),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -1412,7 +1414,7 @@ class CommunicateSummableTensorPairFn:
             if get_parallel().tp_size == get_parallel().attn_dp_size:
                 group = get_tp_group()
             else:
-                group = get_attention_tp_group()
+                group = get_parallel().attn_tp_group
             hidden_states_output, global_hidden_states = (
                 get_local_dp_buffer(group),
                 hidden_states,
