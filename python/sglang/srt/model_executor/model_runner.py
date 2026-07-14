@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import gc
 import inspect
 import logging
 import os
@@ -26,33 +25,12 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
-from torch import nn
 
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.configs import (
-    BailingHybridConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    Lfm2Config,
-    Lfm2MoeConfig,
-    Lfm2VlConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    ZayaConfig,
-)
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -69,18 +47,12 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed import (
-    get_default_distributed_backend,
-    get_pp_group,
+    bootstrap,
     get_tp_group,
     get_world_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-    set_custom_all_reduce,
-    set_mscclpp_all_reduce,
-    set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
+    prealloc_symmetric_memory_pool,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.dllm.config import DllmConfig
@@ -99,7 +71,6 @@ from sglang.srt.eplb.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import (
-    ExpertLocationMetadata,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
@@ -118,7 +89,7 @@ from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGra
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
@@ -128,18 +99,16 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
-from sglang.srt.layers.dp_attention import (
-    initialize_dp_attention,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -151,7 +120,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
-    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -161,6 +129,12 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.weight_exporter import (
+    WeightExporter,
+)
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+)
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -173,16 +147,15 @@ from sglang.srt.model_executor.runner import (
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
-from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_flags, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -205,20 +178,17 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     broadcast_pyobj,
     cpu_has_amx_support,
-    dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_cpu_ids_by_node,
-    init_custom_process_group,
+    init_cublas,
     is_hip,
     is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
-    monkey_patch_p2p_access_check,
+    numa_utils,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
@@ -232,16 +202,9 @@ from sglang.srt.utils.offloader import (
     get_offloader,
     set_offloader,
 )
-from sglang.srt.utils.patch_torch import (
-    monkey_patch_torch_reductions,
-    register_sgl_tp_rank,
-)
+from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
-from sglang.srt.weight_sync.tensor_bucket import (
-    FlattenedTensorBucket,
-    FlattenedTensorMetadata,
-)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -256,32 +219,11 @@ if _is_npu:
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
-TORCH_DTYPE_TO_KV_CACHE_STR = {
-    torch.float8_e4m3fn: "fp8_e4m3",
-    torch.float8_e4m3fnuz: "fp8_e4m3",
-    torch.float8_e5m2: "fp8_e5m2",
-    torch.bfloat16: "bf16",
-}
-
-
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
 logger = logging.getLogger(__name__)
-
-_UNSET: Any = object()
-
-
-def resolve_language_model(model: nn.Module) -> nn.Module:
-    model_cls_name = model.__class__.__name__
-    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
-        return model.thinker.model
-    if hasattr(model, "model"):
-        return model.model
-    if hasattr(model, "language_model"):
-        return model.language_model
-    return model.model
 
 
 @dataclass
@@ -360,17 +302,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
-        self.is_hybrid_swa_compress = getattr(
-            model_config, "is_hybrid_swa_compress", False
-        )
+        self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
-        rope_scaling = getattr(
-            model_config.hf_text_config, "rope_parameters", None
-        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
-        self.model_is_mrope = (
-            rope_scaling is not None and "mrope_section" in rope_scaling
-        )
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self.init_new_workspace = False
@@ -397,7 +331,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and server_args.speculative_draft_model_path
         ):
             # Load draft config to get layer count for KV cache sizing
-            draft_model_config = self._build_model_config(
+            draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=server_args.speculative_draft_model_path,
                 model_revision=server_args.speculative_draft_model_revision,
@@ -434,7 +368,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building draft context features.
-            draft_model_config = self._build_model_config(
+            draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -530,7 +464,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
-        self.pre_model_load_memory = self.init_torch_distributed()
+        self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -560,8 +494,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
-
-        self._linear_attn_registry_cache: Any = _UNSET
 
         # Load model weights and configure
         self.initialize()
@@ -593,17 +525,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
-        self._model_update_group = {}
-        self._weights_send_group = {}
+        self.init_weight_updater()
+        self.init_weight_exporter()
 
-    def _build_model_config(
-        self, server_args, model_path=None, model_revision=None, is_draft_model=False
-    ):
-        return ModelConfig.from_server_args(
-            server_args,
-            model_path=model_path,
-            model_revision=model_revision,
-            is_draft_model=is_draft_model,
+    def init_weight_updater(self):
+        self.weight_updater = WeightUpdater(
+            tp_rank=self.tp_rank,
+            device=self.device,
+            gpu_id=self.gpu_id,
+            model_config=self.model_config,
+            custom_weight_loaders=self.server_args.custom_weight_loader,
+            get_model=lambda: self.model,
+            update_model_fields=self.update_model_fields,
+            recapture_cuda_graph=self.init_decode_cuda_graph,
+            get_model_runner=lambda: self,
+        )
+
+    def init_weight_exporter(self):
+        self.weight_exporter = WeightExporter(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            gpu_id=self.gpu_id,
+            get_model_path=lambda: self.model_config.model_path,
+            get_model=lambda: self.model,
         )
 
     def init_msprobe(self):
@@ -779,13 +723,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
-            if not cuda_graph_fully_disabled():
-                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
-                # intermediate buffers before init_memory_pool() so memory
-                # profiling accounts for them. The buffers are reused by
-                # any captured graph (decode today; widen here so any
-                # future prefill capture path also picks them up).
-                self._init_lora_cuda_graph_moe_buffers()
 
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
@@ -793,7 +730,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             enable_batch_invariant_mode()
 
-        # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
@@ -881,7 +817,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_aux_hidden_state_capture()
 
         if self.device == "cuda" or self.device == "musa":
-            self.init_cublas()
+            init_cublas()
             self.init_attention_backend()
         elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
@@ -945,7 +881,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.forward_hooks:
             register_forward_hooks(self.model, self.server_args.forward_hooks)
 
-        self.prealloc_symmetric_memory_pool()
+        prealloc_symmetric_memory_pool(
+            is_draft_worker=self.is_draft_worker,
+            enable_symm_mem=self.server_args.enable_symm_mem,
+            device=self.device,
+            forward_stream=self.forward_stream,
+        )
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
@@ -1157,150 +1098,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
     def init_torch_distributed(self):
-        tic = time.perf_counter()
-        logger.info("Init torch distributed begin.")
-
-        try:
-            torch.get_device_module(self.device).set_device(self.gpu_id)
-        except Exception:
-            logger.warning(
-                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
-            )
-            raise
-
-        backend = get_default_distributed_backend(self.device)
-        if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
-            backend = "mooncake"
-            if self.server_args.mooncake_ib_device:
-                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                    get_ib_devices_for_gpu,
-                )
-
-                ib_device_for_gpu = get_ib_devices_for_gpu(
-                    self.server_args.mooncake_ib_device, self.gpu_id
-                )
-                mooncake_ib_device = (
-                    ib_device_for_gpu.split(",") if ib_device_for_gpu else []
-                )
-                try:
-                    from mooncake import ep as mooncake_ep
-
-                    mooncake_ep.set_device_filter(mooncake_ib_device)
-                except:
-                    pass  # A warning will be raised in `init_distributed_environment`
-
-        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if not self.server_args.enable_p2p_check:
-            monkey_patch_p2p_access_check()
-
-        # Allow external orchestrators (e.g. trainpi) to override the distributed
-        # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
-        # env-vars and an externally-created TCPStore, completely avoiding port
-        # conflicts with intra-host collocation.
-        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
-        if dist_init_method_override:
-            dist_init_method = dist_init_method_override
-        elif self.server_args.dist_init_addr:
-            na = NetworkAddress.parse(self.server_args.dist_init_addr)
-            dist_init_method = na.to_tcp()
-        else:
-            dist_init_method = NetworkAddress(
-                self.server_args.host or "127.0.0.1", self.dist_port
-            ).to_tcp()
-        set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
-        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
-
-        if not self.is_draft_worker:
-            if self.device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64:
-                    # Bind OpenMP threads to CPU cores
-                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
-
-                    # Set local size to hint SGLang to use shared memory based AllReduce
-                    os.environ["LOCAL_SIZE"] = str(self.tp_size)
-                    torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
-
-                else:
-                    logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
-                    )
-
-            # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-                timeout=self.server_args.dist_timeout,
-                moe_a2a_backend=self.server_args.moe_a2a_backend,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
-            )
-            initialize_model_parallel(
-                tensor_model_parallel_size=self.tp_size,
-                attention_data_parallel_size=self.attn_dp_size,
-                pipeline_model_parallel_size=self.pp_size,
-                expert_model_parallel_size=self.moe_ep_size,
-                attention_context_model_parallel_size=self.attn_cp_size,
-                moe_data_model_parallel_size=self.moe_dp_size,
-                decode_context_parallel_size=self.dcp_size,
-                duplicate_tp_group=self.server_args.enable_pdmux,
-                enable_symm_mem=self.server_args.enable_symm_mem,
-                recovered_rank=self.server_args.elastic_ep_rejoin,
-            )
-            initialize_dp_attention(
-                server_args=self.server_args,
-                model_config=self.model_config,
-            )
-            if is_npu():
-                register_sgl_tp_rank(self.gpu_id)
-
-            # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
-            # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-            if self.server_args.pre_warm_nccl and (
-                self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
-            ):
-                warmup_start = time.perf_counter()
-                tp_group_handle = get_tp_group().device_group
-
-                # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
-                warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
-                dist.all_reduce(warmup_tensor, group=tp_group_handle)
-                current_platform.synchronize()
-
-                warmup_elapsed = time.perf_counter() - warmup_start
-                logger.info(
-                    f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
-                    f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
-                )
-
-        pre_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+        result = bootstrap.init_torch_distributed(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            device=self.device,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            dp_size=self.attn_dp_size,
+            attn_cp_size=self.attn_cp_size,
+            moe_ep_size=self.moe_ep_size,
+            moe_dp_size=self.moe_dp_size,
+            dcp_size=self.dcp_size,
+            dist_port=self.dist_port,
+            is_draft_worker=self.is_draft_worker,
+            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
         )
-        self.tp_group = get_tp_group()
-        self.pp_group = get_pp_group()
-        self.attention_tp_group = get_parallel().attn_tp_group
-
-        # Check memory for tensor parallelism
-        local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.tp_size > 1 and not self.is_draft_worker:
-            if pre_model_load_memory < local_gpu_memory * 0.9:
-                msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
-                    raise RuntimeError(msg)
-                else:
-                    logger.warning(msg)
-
-        logger.info(
-            f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
-            f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
-        )
-        return pre_model_load_memory
+        self.tp_group = result.tp_group
+        self.pp_group = result.pp_group
+        self.attention_tp_group = result.attention_tp_group
+        self.pre_model_load_memory = result.pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         """
@@ -1658,52 +1477,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             set_global_lplb_solver(lid, solver)
         logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
-    def update_expert_location(
-        self,
-        new_expert_location_metadata: ExpertLocationMetadata,
-        update_layer_ids: List[int],
-    ):
-        p2p_missing_logical_experts = self.expert_location_updater.update(
-            self.model.routed_experts_weights_of_layer,
-            new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-            nnodes=self.server_args.nnodes,
-            rank=self.tp_rank,
-        )
-
-        if len(p2p_missing_logical_experts) > 0:
-            # Load the missing expert weights from disk
-            if callable(getattr(self.model, "generate_weight_name_filter", None)):
-                # Filter and load only missing expert weights
-                weight_name_filter = self.model.generate_weight_name_filter(
-                    p2p_missing_logical_experts
-                )
-            else:
-                # Do a full reload from disk/DRAM
-                logger.info(
-                    "[Elastic EP] Model does not implement generate_weight_name_filter. "
-                    "Performing full weight reload."
-                )
-                weight_name_filter = None
-
-            if (
-                self.expert_backup_client is not None
-                and self.expert_backup_client.use_backup
-            ):
-                # Load the missing weights from the DRAM backup
-                self.expert_backup_client.update_weights(weight_name_filter)
-            else:
-                # Load the missing weights from disk
-                self.update_weights_from_disk(
-                    get_server_args().model_path,
-                    get_server_args().load_format,
-                    weight_name_filter=weight_name_filter,
-                )
-
-        # Re-init LPLB solvers after expert location update
-        if self.server_args.ep_dispatch_algorithm == "lp":
-            self._init_lplb_solvers()
-
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
         # synchronization, and this function is on the forward-path.
@@ -1764,409 +1537,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "All ranks are marked as elastic_ep_rejoin."
         )
 
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        load_format: str,
-        weight_name_filter: Optional[Callable[[str], bool]] = None,
-        recapture_cuda_graph: bool = False,
-    ) -> tuple[bool, str]:
-        """Update engine weights in-place from the disk."""
-        logger.info(
-            f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
-        )
-
-        target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
-
-        # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
-        if not isinstance(loader, DefaultModelLoader):
-            message = f"Failed to get model loader: {loader}."
-            return False, message
-
-        def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self.model)
-            )
-            if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
-                )
-
-            return iter
-
-        def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
-            return model
-
-        with set_default_torch_dtype(self.model_config.dtype):
-            try:
-                iter = get_weight_iter(self.model_config)
-            except Exception as e:
-                message = f"Failed to get weights iterator: {e}."
-                return False, message
-            try:
-                model = model_load_weights(self.model, iter)
-            except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
-                del iter
-                gc.collect()
-                iter = get_weight_iter(self.model_config)
-                self.model = model_load_weights(self.model, iter)
-                return False, message
-
-        self.model = model
-        self.server_args.override(
-            "model_runner.update_weights",
-            model_path=model_path,
-            load_format=load_format,
-        )
-        self.load_config = load_config
-
-        if recapture_cuda_graph and (
-            self.device == "cuda"
-            or self.device == "musa"
-            or (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            )
-        ):
-            self.init_decode_cuda_graph()
-
-        logger.info("Update weights end.")
-        return True, "Succeeded to update model weights."
-
-    def init_weights_send_group_for_remote_instance(
-        self,
-        master_address,
-        ports,
-        group_rank,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
-        assert group_name != "", "Group name cannot be empty"
-
-        ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
-
-        logger.info(
-            f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
-            f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
-        )
-
-        current_platform.empty_cache()
-        success = False
-        message = ""
-        try:
-            na = NetworkAddress(master_address, group_port)
-            self._weights_send_group[group_name] = init_custom_process_group(
-                backend=backend,
-                init_method=na.to_tcp(),
-                world_size=world_size,
-                rank=group_rank,
-                group_name=group_name,
-                device_id=torch.device("cuda", self.gpu_id),
-            )
-            dist.barrier(group=self._weights_send_group[group_name])
-            success = True
-            message = f"Succeeded to init group through {na.to_host_port_str()} group."
-        except Exception as e:
-            message = f"Failed to init group: {e}."
-            logger.error(message)
-
-        current_platform.empty_cache()
-        return success, message
-
-    def send_weights_to_remote_instance(
-        self,
-        master_address,
-        ports,
-        group_name,
-    ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
-        assert group_name != "", "Group name cannot be empty"
-
-        ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
-
-        if self._weights_send_group[group_name] is not None:
-            send_group = self._weights_send_group[group_name]
-        else:
-            message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
-            logger.error(message)
-            return False, message
-
-        current_platform.empty_cache()
-        success = False
-        na = NetworkAddress(master_address, group_port)
-        message = ""
-        try:
-            for _, weights in self.model.named_parameters():
-                torch.distributed.broadcast(
-                    weights,
-                    src=0,
-                    group=send_group,
-                )
-            success = True
-            message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
-        except Exception as e:
-            message = f"Failed to send weights: {e}."
-            logger.error(message)
-
-        # destroy the process group after sending weights
-        del self._weights_send_group[group_name]
-        torch.distributed.distributed_c10d.destroy_process_group(send_group)
-        current_platform.empty_cache()
-        return success, message
-
-    def init_weights_update_group(
-        self,
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
-        """Initialize the Torch process group for model parameter updates.
-
-        `_model_update_group` is used in the RLHF workflow, where rank
-        0 is the actor model in the training engine, and the other ranks are
-        the inference engine, which is used for rollout.
-
-        In the RLHF workflow, the training engine updates the model
-        weights/parameters online, and broadcasts them to the inference
-        engine through the `_model_update_group` process group.
-        """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
-        assert group_name != "", "Group name cannot be empty"
-
-        rank = rank_offset + self.tp_rank
-
-        logger.info(
-            f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
-        )
-
-        try:
-            na = NetworkAddress(master_address, master_port)
-            self._model_update_group[group_name] = init_custom_process_group(
-                backend=backend,
-                init_method=na.to_tcp(),
-                world_size=world_size,
-                rank=rank,
-                group_name=group_name,
-            )
-            return True, "Succeeded to initialize custom process group."
-        except Exception as e:
-            message = f"Failed to initialize custom process group: {e}."
-            logger.error(message)
-            return False, message
-
-    def destroy_weights_update_group(self, group_name):
-        try:
-            if group_name in self._model_update_group:
-                pg = self._model_update_group.pop(group_name)
-                torch.distributed.destroy_process_group(pg)
-                return True, "Succeeded to destroy custom process group."
-            else:
-                return False, "The group to be destroyed does not exist."
-        except Exception as e:
-            message = f"Failed to destroy custom process group: {e}."
-            logger.error(message)
-            return False, message
-
-    def update_weights_from_distributed(
-        self,
-        names,
-        dtypes,
-        shapes,
-        group_name,
-        load_format: Optional[str] = None,
-    ):
-        """
-        Update specific parameter in the model weights online
-        through `_model_update_group` process group.
-
-        Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
-        """
-
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
-            "Please call `init_weights_update_group` first."
-        )
-
-        if load_format == "flattened_bucket":
-            return self._update_bucketed_weights_from_distributed(
-                names, dtypes, shapes, group_name
-            )
-        try:
-            weights = []
-            handles = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
-                weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
-
-            self.model.load_weights(weights)
-            return True, "Succeeded to update parameter online."
-
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
-    def _update_bucketed_weights_from_distributed(
-        self, names, dtypes, shapes, group_name
-    ):
-        try:
-            named_tensors = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                named_tensors.append(
-                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
-                )
-            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            flattened_tensor = bucket.get_flattened_tensor()
-            torch.distributed.broadcast(
-                flattened_tensor,
-                src=0,
-                group=self._model_update_group[group_name],
-            )
-            reconstructed_tensors = bucket.reconstruct_tensors()
-            self.model.load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
-    def update_weights_from_tensor(
-        self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
-        load_format: Optional[str] = None,
-    ):
-        monkey_patch_torch_reductions()
-        if load_format == "flattened_bucket":
-            # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
-            )
-
-        # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self.device)
-        infered_device = device_module.current_device()
-
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
-            _model_load_weights_direct(self.model, named_tensors)
-        elif load_format in self.server_args.custom_weight_loader:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
-        elif load_format is None:
-            self.model.load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
-        return True, "Success"
-
-    def _update_weights_from_flattened_bucket(
-        self,
-        flattened_tensor_bucket_dict,
-    ):
-        """Handle flattened bucket format for weight updates"""
-        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
-        metadata = flattened_tensor_bucket_dict["metadata"]
-
-        # Convert metadata dict to our format
-        converted_metadata = []
-        for meta in metadata:
-            converted_meta = FlattenedTensorMetadata(
-                name=meta.name,
-                shape=meta.shape,
-                dtype=meta.dtype,
-                start_idx=meta.start_idx,
-                end_idx=meta.end_idx,
-                numel=meta.numel,
-            )
-            converted_metadata.append(converted_meta)
-
-        # Create bucket and reconstruct tensors
-        bucket = FlattenedTensorBucket(
-            flattened_tensor=flattened_tensor, metadata=converted_metadata
-        )
-        reconstructed_tensors = bucket.reconstruct_tensors()
-
-        # Load the reconstructed tensors using the standard method
-        self.model.load_weights(reconstructed_tensors)
-
-        return True, "Success"
-
-    def get_weights_by_name(
-        self, name: str, truncate_size: int = 100
-    ) -> Optional[torch.Tensor]:
-        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
-
-        Only used for unit test with an unoptimized performance.
-        For optimized performance, please use torch.save and torch.load.
-        """
-        # TODO: (chenyang) Add support for Qwen models.
-        try:
-            return self.model.get_weights_by_name(
-                name, truncate_size, tp_size=self.tp_size
-            )
-        except Exception as e:
-            logger.error(f"Error when getting parameter {name}: {e}")
-            return None
-
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -2182,141 +1552,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
         )
-
-    def _init_lora_cuda_graph_moe_buffers(self):
-        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
-
-        Must be called before init_memory_pool() so that memory profiling
-        sees the reduced available memory and sizes KV cache correctly.
-        All MoE LoRA layers share one set of buffers (managed by the
-        lora_backend) since they execute sequentially during forward.
-
-        Phase 2 (dense LoRA batch metadata) is handled later in
-        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-        because it needs capture-time parameters (max_bs, num_tokens_per_req)
-        that are only available at that stage.
-        """
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
-
-        max_bs = self.server_args.cuda_graph_config.decode.max_bs
-        max_loras = self.server_args.max_loras_per_batch
-        for module in self.model.modules():
-            if isinstance(module, FusedMoEWithLoRA):
-                self.lora_manager.init_cuda_graph_moe_buffers(
-                    max_bs, max_loras, self.dtype, module
-                )
-                logger.info(
-                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                    f"(max_bs={max_bs}, max_loras={max_loras})"
-                )
-                break
+        if not cuda_graph_fully_disabled():
+            init_lora_cuda_graph_moe_buffers(
+                server_args=self.server_args,
+                model=self.model,
+                lora_manager=self.lora_manager,
+                dtype=self.dtype,
+            )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
-
-        logger.info(
-            f"LoRA adapter loading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        result = self.lora_manager.load_lora_adapter(lora_ref)
-
-        logger.info(
-            f"LoRA adapter loading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        return result
+        return self.lora_manager.load_lora_adapter(lora_ref)
 
     def load_lora_adapter_from_tensors(
         self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
     ):
-        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
-        result = self.lora_manager.load_lora_adapter_from_tensors(
+        return self.lora_manager.load_lora_adapter_from_tensors(
             lora_ref, tensors, config_dict, added_tokens_config
         )
-        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
-        return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
-
-        logger.info(
-            f"LoRA adapter unloading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        result = self.lora_manager.unload_lora_adapter(lora_ref)
-
-        logger.info(
-            f"LoRA adapter unloading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        return result
-
-    @property
-    def qwen3_next_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
-            return config
-        return None
-
-    @property
-    def hybrid_lightning_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, BailingHybridConfig):
-            return config
-        return None
-
-    @property
-    def hybrid_gdn_config(self):
-        config = self.model_config.hf_config.get_text_config()
-        if isinstance(
-            config,
-            Qwen3NextConfig
-            | Qwen3_5Config
-            | Qwen3_5MoeConfig
-            | InternS2PreviewConfig
-            | JetNemotronConfig
-            | JetVLMConfig,
-        ):
-            return config
-        return None
-
-    @property
-    def mamba2_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
-            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
-            # so they shouldn't use HybridLinearAttnBackend
-            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
-            if pattern is not None and "M" not in pattern:
-                return None
-        if isinstance(
-            config,
-            FalconH1Config
-            | NemotronHConfig
-            | Lfm2Config
-            | Lfm2MoeConfig
-            | Lfm2VlConfig
-            | ZayaConfig,
-        ):
-            return config
-        if isinstance(config, NemotronH_Nano_VL_V2_Config):
-            return config.llm_config
-
-        if isinstance(config, GraniteMoeHybridConfig):
-            has_mamba = any(
-                layer_type == "mamba"
-                for layer_type in getattr(config, "layer_types", [])
-            )
-            if not has_mamba:
-                return None
-            else:
-                return config
-
-        return None
+        return self.lora_manager.unload_lora_adapter(lora_ref)
 
     @property
     def effective_max_total_num_tokens(self):
@@ -2325,38 +1582,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
-
-    @property
-    def kimi_linear_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, KimiLinearConfig):
-            return config
-        return None
-
-    def _get_linear_attn_registry_result(self):
-        if self._linear_attn_registry_cache is _UNSET:
-            self._linear_attn_registry_cache = get_linear_attn_config(
-                self.model_config.hf_config
-            )
-        return self._linear_attn_registry_cache
-
-    @property
-    def linear_attn_model_spec(self):
-        result = self._get_linear_attn_registry_result()
-        return result[0] if result else None
-
-    @property
-    def mambaish_config(self):
-        existing = (
-            self.mamba2_config
-            or self.hybrid_gdn_config
-            or self.kimi_linear_config
-            or self.hybrid_lightning_config
-        )
-        if existing:
-            return existing
-        result = self._get_linear_attn_registry_result()
-        return result[1] if result else None
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
         # Load-time resolution transition: the weight-resolved kv-cache dtype
@@ -2378,69 +1603,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def configure_kv_cache_dtype(self):
-        if self.server_args.kv_cache_dtype == "auto":
-            quant_config = getattr(self.model, "quant_config", None)
-            kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
-            if (
-                isinstance(kv_cache_quant_algo, str)
-                and kv_cache_quant_algo.upper() == "FP8"
-            ):
-                self.kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
-                self._record_kv_cache_dtype(
-                    TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
-                )
-            else:
-                self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = fp8_dtype
-            else:
-                self.kv_cache_dtype = torch.float8_e5m2
-        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = fp8_dtype
-            else:
-                self.kv_cache_dtype = torch.float8_e4m3fn
-        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
-            self.kv_cache_dtype = torch.bfloat16
-        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
-            if hasattr(torch, "float4_e2m1fn_x2"):
-                self.kv_cache_dtype = torch.float4_e2m1fn_x2
-                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
-            else:
-                logger.warning(
-                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
-                )
-                self.kv_cache_dtype = self.dtype
-        else:
-            raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+        resolved_kv_cache_dtype, self.kv_cache_dtype = (
+            kv_cache_dtype.configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                model=self.model,
+                model_dtype=self.dtype,
+                is_draft_worker=self.is_draft_worker,
+                is_dflash=self.spec_algorithm.is_dflash(),
+                speculative_draft_attention_backend=self.server_args.speculative_draft_attention_backend,
             )
-
-        # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
-        # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
-        if (
-            self.is_draft_worker
-            and self.spec_algorithm.is_dflash()
-            and self.server_args.speculative_draft_attention_backend == "fa4"
-            and self.kv_cache_dtype != self.dtype
-        ):
-            logger.info(
-                "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
-                "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
-                self.kv_cache_dtype,
-                self.dtype,
-            )
-            self.kv_cache_dtype = self.dtype
-
-    def init_cublas(self):
-        """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
-        dtype = torch.float16
-        device = "cuda"
-        a = torch.ones((16, 16), dtype=dtype, device=device)
-        b = torch.ones((16, 16), dtype=dtype, device=device)
-        c = a @ b
-        return c
+        )
+        if resolved_kv_cache_dtype is not None:
+            self._record_kv_cache_dtype(resolved_kv_cache_dtype)
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
@@ -2818,45 +1992,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_threads_binding(self):
-        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
-        cpu_ids_by_node = get_cpu_ids_by_node()
-        n_numa_node = len(cpu_ids_by_node)
-        if omp_cpuids == "all":
-            assert self.tp_size <= n_numa_node, (
-                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-                f"tp_size {self.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
-                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
-                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
-                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
-                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-                f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
-                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
-            )
-            if self.tp_size < n_numa_node:
-                logger.warning(
-                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {self.tp_size}, so only {self.tp_size} numa nodes are used."
-                )
-            self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
-        else:
-            threads_bind_list = omp_cpuids.split("|")
-            assert self.tp_size == len(threads_bind_list), (
-                f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({self.tp_size}). "
-                f"Please double check your settings."
-            )
-            self.local_omp_cpuid = threads_bind_list[self.tp_rank]
-            if self.tp_size > n_numa_node:
-                logger.warning(
-                    f"TP size ({self.tp_size})is larger than numa node number ({n_numa_node}), "
-                    f"in this case the available memory amount of each rank cannot be determined in prior. "
-                    f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
-                )
+        self.local_omp_cpuid = numa_utils.init_threads_binding(
+            tp_rank=self.tp_rank, tp_size=self.tp_size
+        )
 
     def apply_torch_tp(self):
-        logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
-        from sglang.srt.layers.model_parallel import tensor_parallel
-
-        device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
-        tensor_parallel(self.model, device_mesh)
+        model_parallel.apply_torch_tp(
+            model=self.model, device=self.device, tp_size=self.tp_size
+        )
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
@@ -2978,7 +2121,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(build_step_span_name(forward_batch))
 
         canary_ctx = (
             context_tuple(
@@ -3280,64 +2423,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.token_ids_logprobs,
         )
 
-    def save_remote_model(self, url: str):
-        from sglang.srt.model_loader.loader import RemoteModelLoader
-
-        logger.info(f"Saving model to {url}")
-        RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
-
-    def save_sharded_model(
-        self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
-    ):
-        from sglang.srt.model_loader.loader import ShardedStateLoader
-
-        logger.info(
-            f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
-        )
-        ShardedStateLoader.save_model(self.model, path, pattern, max_size)
-
     def check_weights(self, action: str, allow_quant_error: bool = False):
         return self._weight_checker.handle(
             action=action, allow_quant_error=allow_quant_error
         )
-
-    def update_weights_from_ipc(self, recv_req):
-        """Update weights from IPC for checkpoint-engine integration."""
-        try:
-            from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
-                SGLangCheckpointEngineWorkerExtensionImpl,
-            )
-
-            # Create a worker extension that integrates with SGLang's model
-            worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
-            worker.update_weights_from_ipc(recv_req.zmq_handles)
-            return True, "IPC weight update completed successfully"
-        except ImportError as e:
-            return False, f"IPC weight update failed: ImportError {e}"
-        except Exception as e:
-            logger.error(f"IPC weight update failed: {e}")
-            return False, str(e)
-
-    def prealloc_symmetric_memory_pool(self):
-        # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
-        if (
-            self.is_draft_worker
-            or not self.server_args.enable_symm_mem
-            or envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() <= 0
-        ):
-            return
-
-        # Memory allocation is tied to a cuda stream, use the forward stream
-        with torch.get_device_module(self.device).stream(self.forward_stream):
-            logger.info(
-                f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
-            )
-            with use_symmetric_memory(get_tp_group()):
-                torch.empty(
-                    (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
-                    dtype=torch.uint8,
-                    device=self.device,
-                )
 
     def _maybe_rebalance_after_rank_fault(
         self,
@@ -3366,35 +2455,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         return output
 
-
-def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
-    params_dict = dict(model.named_parameters())
-    for name, tensor in named_tensors:
-        default_weight_loader(params_dict[name], tensor)
-
-
-def _unwrap_tensor(tensor, tp_rank, device):
-    if isinstance(tensor, LocalSerializedTensor):
-        tensor = tensor.get(tp_rank)
-    return tensor.to(device)
-
-
-def _build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
-    mode = forward_batch.forward_mode
-    bs = forward_batch.batch_size
-    if mode == ForwardMode.EXTEND:
-        ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
-
-
-@dataclass
-class LocalSerializedTensor:
-    """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
-    The i-th element in the list corresponds to i-th rank's GPU."""
-
-    values: List[bytes]
-
-    def get(self, rank: int):
-        return MultiprocessingSerializer.deserialize(self.values[rank])
+    def update_model_fields(
+        self,
+        new_model: torch.nn.Module,
+        *,
+        model_path: str,
+        load_format: str,
+        load_config: LoadConfig,
+    ) -> None:
+        self.model = new_model
+        self.server_args.override(
+            "model_runner.update_model_fields",
+            model_path=model_path,
+            load_format=load_format,
+        )
+        self.load_config = load_config
