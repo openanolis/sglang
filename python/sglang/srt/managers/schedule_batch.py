@@ -77,6 +77,11 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_decode,
+    alloc_for_extend,
+)
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -85,11 +90,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
-    alloc_for_decode,
-    alloc_for_extend,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
-    get_alloc_reserve_per_decode,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -2173,10 +2175,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # allocation in alloc_for_extend above; they are currently a few
             # steps apart and should become one owned-kv allocation step.
             req.kv_committed_len = seq_len
-            if req.kv is None:
-                req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
-            else:
-                req.kv.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -2776,7 +2774,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
-            req.kv.kv_allocated_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
