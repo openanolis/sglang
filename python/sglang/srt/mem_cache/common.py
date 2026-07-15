@@ -70,6 +70,9 @@ def free_swa_out_of_window_slots(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
 ) -> None:
+    if req.kv is None:
+        return
+
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
         req.cache_protected_len % page_size == 0
@@ -640,17 +643,19 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    effective_kv_committed_len = req.effective_kv_committed_len()
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+        kv_len_to_handle=effective_kv_committed_len,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
-    # and bookkeeping flag sync internally, then sets req_pool_idx = None.
+    # internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
         return
 
-    start_p, end_p = req.pop_overallocated_kv_cache()
+    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
 
     global_server_args = get_server_args()
     page_size = global_server_args.page_size
@@ -681,6 +686,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # DSV4-NPU's free() also releases c4/c128 state pages; no-op for others.
     tree_cache.req_to_token_pool.free(req)
+    req.kv = None
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
