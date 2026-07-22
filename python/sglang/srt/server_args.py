@@ -7877,21 +7877,22 @@ class ServerArgs:
             object.__setattr__(self, "_in_override", False)
 
     def __setattr__(self, name, value):
-        # After materialization the fields are the resolved configuration:
-        # under the strict test harness, a bare assignment outside
-        # ServerArgs.override() (and the resolution pipeline itself) raises.
+        # after materialization the fields are the resolved startup
+        # configuration -- the pristine, READ-ONLY record. A bare assignment
+        # outside ServerArgs.override() (and the resolution pipeline, which runs
+        # before materialization) always raises; resolved config is mutated on
+        # the context bags via get_context().override(...), not here. (Formerly
+        # gated on SGLANG_STRICT_CONFIG_MUTATION; now unconditional.)
         if (
             not name.startswith("_")
             and getattr(self, "_declarations_materialized", False)
             and not getattr(self, "_in_override", False)
         ):
-            from sglang.srt.environ import envs
-
-            if envs.SGLANG_STRICT_CONFIG_MUTATION.get():
-                raise AttributeError(
-                    f"server_args.{name} assigned after resolution; use "
-                    "server_args.override(source, ...) instead."
-                )
+            raise AttributeError(
+                f"server_args.{name} assigned after resolution; server_args is "
+                "read-only -- use get_context().override(source, ...) to change "
+                "resolved config."
+            )
         object.__setattr__(self, name, value)
 
     def _resolved_attention_backends(self):
@@ -8568,14 +8569,19 @@ class ServerArgs:
 # (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    """Legacy publish shim — prefer ``get_context().set_server_args()`` from
-    ``sglang.srt.runtime_context`` in new code."""
-    from sglang.srt.runtime_context import get_context
+    """Legacy publish shim (role=scheduler) — prefer
+    ``runtime_context.publish(server_args, role=...)`` in new code."""
+    from sglang.srt.runtime_context import publish
 
-    get_context().set_server_args(server_args)
+    publish(server_args, role="scheduler")
 
 
-set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
+def set_global_server_args_for_tokenizer(server_args: ServerArgs):
+    """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
+    the process role differs."""
+    from sglang.srt.runtime_context import publish
+
+    publish(server_args, role="tokenizer")
 
 
 def get_global_server_args() -> ServerArgs:
