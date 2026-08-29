@@ -24,7 +24,6 @@ import unittest
 import unittest.mock
 
 import sglang
-from sglang.srt import server_args as server_args_module
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -147,7 +146,7 @@ def _late_resolvers():
                     if isinstance(node.func, ast.Attribute)
                     else getattr(node.func, "id", None)
                 )
-                if called in ("declare_late_resolution", "_late_resolution"):
+                if called == "declare_late_resolution":
                     return True
                 if called and reaches(called, seen):
                     return True
@@ -526,14 +525,16 @@ class TestResolutionDeclarations(CustomTestCase):
             reset_context()
             child = pickle.loads(blob)
             entered = []
-            original = ServerArgs._run_resolution_pipeline
+            from sglang.srt.arg_groups import pipeline as pipeline_module
 
-            def counted(self, _original=original):
+            original = pipeline_module.run_resolution_pipeline
+
+            def counted(server_args, _original=original):
                 entered.append(1)
-                return _original(self)
+                return _original(server_args)
 
             with unittest.mock.patch.object(
-                ServerArgs, "_run_resolution_pipeline", counted
+                pipeline_module, "run_resolution_pipeline", counted
             ):
                 publish(child, role="scheduler")
             self.assertEqual(
@@ -848,7 +849,7 @@ class TestResolutionDeclarations(CustomTestCase):
             "capturing like apply_server_args_defaults",
         )
 
-        pipeline = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
+        pipeline = (_SRT / "arg_groups" / "pipeline.py").read_text(encoding="utf-8-sig")
         for hook in sorted(taking_the_record):
             self.assertIn(
                 f"current_platform.{hook},",
@@ -885,16 +886,20 @@ class TestResolutionDeclarations(CustomTestCase):
         # The pipeline asks the platform other questions on the way through
         # (whether it is out of tree, whether it supports piecewise capture),
         # and which of those it reaches depends on the host.
-        class _Plugin(type(server_args_module.current_platform)):
+        from sglang.srt.platforms import current_platform
+
+        class _Plugin(type(current_platform)):
             device_name = "oot"
 
             def apply_server_args_defaults(self, server_args):
                 server_args.attention_backend = "triton"
                 server_args.schedule_conservativeness = 0.5
 
-        with unittest.mock.patch.object(
-            server_args_module, "current_platform", _Plugin()
-        ):
+        from sglang.srt.arg_groups import pipeline as pipeline_module
+
+        # The write capture runs in the dispatcher, so that is the namespace the
+        # plugin has to be installed in.
+        with unittest.mock.patch.object(pipeline_module, "current_platform", _Plugin()):
             server_args = self._resolve({})
         self.assertEqual(
             (
