@@ -64,7 +64,7 @@ class _FakeRunner:
         # (op, rid) -> needs_logits as received; guards the worker's
         # chunk-finality derivation reaching the runner intact.
         self.logits_flags: dict[tuple[str, str], bool] = {}
-        self.removed_sync_kv: dict[str, bool] = {}
+        self.prefix_slot_ids: dict[str, list[int]] = {}
         self._req_caches: dict[str, list] = {}
         self._counter = 0
 
@@ -72,12 +72,8 @@ class _FakeRunner:
     def has_request(self, rid):
         return rid in self._known
 
-    def flush_all_decode_kv(self):
-        pass
-
-    def remove_request(self, rid, sync_kv=True):
+    def remove_request(self, rid):
         self.calls.append(("remove_request", rid))
-        self.removed_sync_kv[rid] = sync_kv
         self._known.discard(rid)
 
     def ops_for(self, rid):
@@ -128,6 +124,7 @@ class _FakeRunner:
 
         self.calls.append(("prefill_start", req_id))
         self.logits_flags[("prefill_start", req_id)] = needs_logits
+        self.prefix_slot_ids[req_id] = list(prefix_slot_ids)
         return SimpleNamespace(
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=[self._fake_cache_layer()],
@@ -265,8 +262,8 @@ class TestMlxExtendRouting(CustomTestCase):
     # ---------- retraction ----------
 
     def test_retracted_request_reprefills_from_scratch(self):
-        """A request retracted after its MLX state was made drops that state
-        without a pool sync, so its re-prefill routes as a fresh prefill."""
+        """A request retracted after its MLX state was made drops that state,
+        so its re-prefill routes as a fresh prefill."""
         worker = self._worker(known_rids=set())
         req = _FakeReq("r1")
         worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
@@ -274,7 +271,6 @@ class TestMlxExtendRouting(CustomTestCase):
 
         req.retraction_count += 1
         worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
-        self.assertEqual(worker._mlx_runner.removed_sync_kv, {"r1": False})
         self.assertEqual(
             worker._mlx_runner.ops_for("r1"),
             ["prefill_start", "remove_request", "prefill_start"],
@@ -341,6 +337,22 @@ class TestMlxExtendRouting(CustomTestCase):
         runner, _ = self._run_async([req], [4], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
+
+    def test_async_prefix_hit_reads_slots_from_runner_pool(self):
+        """A radix prefix hit takes its slots from the stub runner's pool:
+        the worker's own req_to_token_pool is None on MLX."""
+        req_to_token = torch.zeros(2, 8, dtype=torch.int32)
+        req_to_token[1, :5] = torch.tensor([11, 12, 13, 14, 15])
+        worker = self._worker(known_rids=set())
+        worker.req_to_token_pool = None
+        worker._model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        req = _FakeReq("r1", req_pool_idx=1)
+        req.prefix_len = 3
+        batch = _FakeBatch(ForwardMode.EXTEND, [req], [2])
+        worker._async_extend_batch(batch)
+        self.assertEqual(worker._mlx_runner.prefix_slot_ids["r1"], [11, 12, 13])
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
