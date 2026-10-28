@@ -23,6 +23,7 @@ Triton kernel.
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -33,11 +34,10 @@ import torch
 from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.test.test_utils import CustomTestCase
 
@@ -65,7 +65,7 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     )
     n_full, n_swa = n_full_pages * ps, n_swa_pages * ps
     total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full_spec, swa_spec],
         device=_DEV,
@@ -75,8 +75,9 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     kvcache = _FakeUnifiedSWAKVPool(pool)
     allocator = ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=kvcache,
+        views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,
@@ -86,8 +87,15 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     )
     # The fake IS the runner's token_to_kv_pool, and the real UnifiedSWAKVPool
     # carries the pool-level full->swa translate, so the fake must too.
-    kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa
+    kvcache.translate_loc_from_full_to_swa = allocator.id_spaces()[
+        IdSpaceKind.SLIDING_WINDOW
+    ].write
     return allocator
+
+
+def _plain_id_spaces():
+    """A static pool's one token sub-pool, indexed by its own ids."""
+    return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
 
 def _make_source(allocator, req_to_token, ps):
@@ -313,7 +321,9 @@ class TestCopyPageTable(unittest.TestCase):
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(
+                id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+            ),
             page_size=1,
             device=_DEV,
         )
@@ -382,7 +392,10 @@ class TestPoolOwnership(unittest.TestCase):
         """Same allocator, different pool: must stay disabled."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.zeros((2, 8), dtype=torch.int32, device=_DEV)
-        own_pool = SimpleNamespace()  # a separate buffer, not the composite's
+        # A separate buffer, not the composite's, indexed by the allocator's ids.
+        own_pool = SimpleNamespace(
+            id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+        )
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
@@ -401,7 +414,9 @@ class TestPoolOwnership(unittest.TestCase):
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(
+                id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+            ),
             page_size=1,
             device=_DEV,
         )
@@ -464,7 +479,7 @@ class TestWriteIds(CustomTestCase):
         src = _make_source(allocator, req_to_token, ps)
         virt = allocator.alloc(-(-n // ps) * ps)[:n]
         want_full = allocator.translate_kv_loc(virt)
-        want_swa = allocator.translate_loc_from_full_to_swa(virt)
+        want_swa = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virt)
         return src, allocator, rows, seq_lens, virt, want_full, want_swa
 
     def test_own_plan_translates_full_side_only(self):
@@ -491,7 +506,7 @@ class TestWriteIds(CustomTestCase):
                 self.subTest(dcp_size=dcp_size),
                 get_parallel().override(attn_dcp_size=dcp_size),
             ):
-                pool = UnifiedKVPool(
+                pool = arena_of(
                     total_bytes=2048,
                     sub_pool_specs=[
                         MHASubPoolSpec(
@@ -518,16 +533,23 @@ class TestWriteIds(CustomTestCase):
                 )
                 allocator = ChainAllocator(
                     roles=ChainRoles(owner="full", state="mamba"),
-                    state_kvcache=(
-                        SimpleNamespace(
-                            full_kv_pool=_FakeKVCache(pool.max_slots("full")),
-                            mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
-                        )
-                    ).mamba_pool,
-                    unified_buffer=pool,
+                    arena=pool,
                     kvcache=SimpleNamespace(
-                        full_kv_pool=_FakeKVCache(pool.max_slots("full")),
-                        mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                        full_kv_pool=_FakeKVCache(pool, "full"),
+                        mamba_pool=_FakeKVCache(pool, "mamba"),
+                    ),
+                    views=stand_in_views(
+                        ChainRoles(owner="full", state="mamba"),
+                        SimpleNamespace(
+                            full_kv_pool=_FakeKVCache(pool, "full"),
+                            mamba_pool=_FakeKVCache(pool, "mamba"),
+                        ),
+                        (
+                            SimpleNamespace(
+                                full_kv_pool=_FakeKVCache(pool, "full"),
+                                mamba_pool=_FakeKVCache(pool, "mamba"),
+                            )
+                        ).mamba_pool,
                     ),
                     device="cpu",
                     page_size=4,
@@ -662,7 +684,9 @@ class TestWriteIds(CustomTestCase):
         plain = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(
+                id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+            ),
             page_size=1,
             device=_DEV,
         )

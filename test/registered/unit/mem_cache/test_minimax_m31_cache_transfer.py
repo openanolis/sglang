@@ -489,8 +489,10 @@ def test_unsupported_stack_fails_before_allocating_host_memory(case):
 def dspark_params(target, draft):
     return CacheInitParams(
         False,
-        None,
-        SimpleNamespace(get_kvcache=lambda: target),
+        # A request table without recurrent-state slots.
+        SimpleNamespace(holds_state_slots=False),
+        # A static allocator: no unified KV storage.
+        SimpleNamespace(get_kvcache=lambda: target, storage=None),
         128,
         sidecar_draft_device_pools=(draft,),
     )

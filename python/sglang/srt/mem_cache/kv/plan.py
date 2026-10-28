@@ -25,10 +25,20 @@ from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 
-# Sub-pool names are external: HiCache keys, PD state types and the draft
-# placement name sub-pools by them.
+# The one chain whose builder resizes the buffer after CUDA graph capture.
+_RESIZED_AFTER_CAPTURE = frozenset({FullLifetime, WindowLifetime})
+
+
+def resized_after_capture(lifetime_types: frozenset) -> bool:
+    """Whether the unified pool of a plan with these lifetimes can resize its
+    buffer after CUDA graph capture."""
+    return lifetime_types == _RESIZED_AFTER_CAPTURE
+
+
+# The draft placement and the id spaces name sub-pools by these.
 _SUB_POOL_NAMES: Dict[Type, str] = {
     FullLifetime: "full",
     WindowLifetime: "swa",
@@ -36,12 +46,48 @@ _SUB_POOL_NAMES: Dict[Type, str] = {
 }
 
 
+class SubPoolExternal(msgspec.Struct, frozen=True, kw_only=True):
+    """The names a sub-pool goes by outside this process, at the values peers,
+    host stores and the radix tree already use: its HiCache host pool (also the
+    suffix of its L3 keys), its radix tree component, and the PD state type it
+    travels as (None for the sub-pool whose token KV PD registers as the
+    transfer's KV entries)."""
+
+    host_pool: str
+    tree_component: str
+    wire: Optional[str] = None
+
+
+_EXTERNAL: Dict[Type, SubPoolExternal] = {
+    FullLifetime: SubPoolExternal(host_pool="kv", tree_component="FULL"),
+    WindowLifetime: SubPoolExternal(host_pool="swa", tree_component="SWA", wire="swa"),
+    StateLifetime: SubPoolExternal(
+        host_pool="mamba", tree_component="MAMBA", wire="mamba"
+    ),
+}
+
+# The order PD peers list state entries in: a window's before recurrent state.
+_WIRE_ORDER = ("swa", "mamba")
+
+
+class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
+    """One PD state entry: the sub-pool part it carries and its state type."""
+
+    sub_pool: str
+    part: str
+    state_type: str
+
+
 class PlannedSubPool(msgspec.Struct, frozen=True, kw_only=True):
     name: str
     lifetime: KVLifetime
+    # Entries per allocation unit: the page for token sub-pools, one entry (a
+    # request's slot) for state.
+    unit: int
     layer_ids: Tuple[int, ...]
     geometry: PartGeometry
     spec: SubPoolSpec
+    external: SubPoolExternal
 
 
 class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
@@ -60,6 +106,11 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         """Specs in the order the unified buffer takes them: the owner first."""
         return [s.spec for s in reversed(self.sub_pools)]
 
+    def sink_bytes(self) -> int:
+        """The padding sink at the low end of the buffer: every sub-pool's
+        dummy writes (entry 0) land in it, so it spans the largest unit."""
+        return max(s.unit * s.spec.entry_bytes() for s in self.sub_pools)
+
     def lifetime_types(self) -> frozenset:
         return frozenset(type(s.lifetime) for s in self.sub_pools)
 
@@ -67,6 +118,29 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         found = [s for s in self.sub_pools if isinstance(s.lifetime, lifetime_type)]
         assert len(found) <= 1, f"more than one {lifetime_type.__name__} sub-pool"
         return found[0] if found else None
+
+    def owner(self) -> PlannedSubPool:
+        """The sub-pool that owns the token id space."""
+        return self.of_lifetime(FullLifetime)
+
+    def owner_first(self) -> Tuple[PlannedSubPool, ...]:
+        """The sub-pools from the owner to the grow-up end: the order host
+        pools and transfers list them in."""
+        return tuple(reversed(self.sub_pools))
+
+    def wire_entries(self) -> Tuple[WireEntry, ...]:
+        """The PD state entries, in the order peers list them. The owner's
+        token KV is the transfer's KV entries, not a state entry."""
+        entries = [
+            WireEntry(
+                sub_pool=s.name,
+                part=STATE_PART if isinstance(s.lifetime, StateLifetime) else KV_PART,
+                state_type=s.external.wire,
+            )
+            for s in self.sub_pools
+            if s.external.wire is not None
+        ]
+        return tuple(sorted(entries, key=lambda e: _WIRE_ORDER.index(e.state_type)))
 
 
 def _unit(lifetime: KVLifetime, page_size: int) -> int:
@@ -175,7 +249,7 @@ def plan_kv_storage(
     chain = sorted(groups, key=_chain_key)
     sub_pools = []
     for i, key in enumerate(chain):
-        lifetime, _ = key
+        lifetime, unit = key
         layer_ids, geometry = groups[key]
         name = _SUB_POOL_NAMES[type(lifetime)]
         grow_direction = "up" if i == 0 else "down" if i == len(chain) - 1 else "float"
@@ -183,6 +257,7 @@ def plan_kv_storage(
             PlannedSubPool(
                 name=name,
                 lifetime=lifetime,
+                unit=unit,
                 layer_ids=tuple(layer_ids),
                 geometry=geometry,
                 spec=_spec_for(
@@ -192,6 +267,7 @@ def plan_kv_storage(
                     grow_direction=grow_direction,
                     fused_draft=fused_draft,
                 ),
+                external=_EXTERNAL[type(lifetime)],
             )
         )
     return KVStoragePlan(

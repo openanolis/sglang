@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
+    pin_every_band,
     setup_allocator_context,
 )
 
@@ -118,7 +119,7 @@ class BuilderAdapter:
         self.bundle = build_unified_bundle(trace_geometry(config))
         self.allocator = self.bundle.token_to_kv_pool_allocator
         self.state_allocator = (
-            self.bundle.req_to_token_pool.mamba_allocator
+            self.bundle.token_to_kv_pool_allocator.state_slots
             if config.chain in STATE_CHAINS
             else None
         )
@@ -126,7 +127,7 @@ class BuilderAdapter:
         self.events: List[FakeEvent] = []
         self.tree = self._build_tree() if config.chain == "swa" else None
         if config.lazy:
-            self.allocator.set_disagg_move_gate(lambda: self.gate_open)
+            pin_every_band(self.allocator, lambda: not self.gate_open)
 
     def _build_tree(self) -> UnifiedRadixCache:
         return UnifiedRadixCache(
@@ -274,8 +275,8 @@ class BuilderAdapter:
         out: Dict[str, object] = {}
         for m in self.members():
             p = m.sub_pool_name
-            out[f"{p}.v2p"] = m.virtual_to_physical.tolist()
-            out[f"{p}.p2v"] = m.physical_to_virtual.tolist()
+            out[f"{p}.v2p"] = m.ids.virtual_to_physical.tolist()
+            out[f"{p}.p2v"] = m.ids.physical_to_virtual.tolist()
             if m.grow_direction == "float":
                 out[f"{p}.edges"] = [m.low_wm_page, m.high_wm_page]
             else:

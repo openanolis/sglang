@@ -56,14 +56,14 @@ class TestTriJointReclaim(CustomTestCase):
             member = (
                 a.full_attn_allocator if layer < full_layers else a.swa_attn_allocator
             )
-            ids = member.translate_kv_loc(slots)
+            ids = member.ids.translate(slots)
             values = slots.to(torch.float16).view(-1, 1, 1) + layer * 100
             kv.get_key_buffer(layer)[ids] = values
             kv.get_value_buffer(layer)[ids] = values + 500
-        mc = b.req_to_token_pool.mamba_pool.mamba_cache
+        mc = b.token_to_kv_pool_allocator.state.pool.mamba_cache
         for j, view in enumerate([*mc.conv, mc.temporal]):
             if view.numel():
-                mids = a.mamba_allocator.translate_kv_loc(states)
+                mids = a.mamba_allocator.ids.translate(states)
                 for i, mid in enumerate(mids):
                     view[:, mid] = i + 10 * j + 1
 
@@ -74,9 +74,9 @@ class TestTriJointReclaim(CustomTestCase):
                 a.full_attn_allocator if layer < full_layers else a.swa_attn_allocator
             )
             self.assertTrue(
-                torch.all(member.virtual_to_physical[slots // a.page_size] > 0)
+                torch.all(member.ids.virtual_to_physical[slots // a.page_size] > 0)
             )
-            ids = member.translate_kv_loc(slots)
+            ids = member.ids.translate(slots)
             values = slots.to(torch.float16).view(-1, 1, 1) + layer * 100
             torch.testing.assert_close(
                 kv.get_key_buffer(layer)[ids],
@@ -86,11 +86,13 @@ class TestTriJointReclaim(CustomTestCase):
                 kv.get_value_buffer(layer)[ids],
                 (values + 500).expand_as(kv.get_value_buffer(layer)[ids]),
             )
-        mc = b.req_to_token_pool.mamba_pool.mamba_cache
-        self.assertTrue(torch.all(a.mamba_allocator.virtual_to_physical[states] > 0))
+        mc = b.token_to_kv_pool_allocator.state.pool.mamba_cache
+        self.assertTrue(
+            torch.all(a.mamba_allocator.ids.virtual_to_physical[states] > 0)
+        )
         for j, view in enumerate([*mc.conv, mc.temporal]):
             if view.numel():
-                mids = a.mamba_allocator.translate_kv_loc(states)
+                mids = a.mamba_allocator.ids.translate(states)
                 for v, mid in zip(states.tolist(), mids):
                     i = original_states.tolist().index(v)
                     self.assertTrue(torch.all(view[:, mid] == i + 10 * j + 1))
@@ -117,7 +119,7 @@ class TestTriJointReclaim(CustomTestCase):
                 with self.subTest(lazy=lazy, occupancy=occupancy, states=count):
                     b, a, c = self.build(lazy=lazy, temporal=temporal)
                     slots = a.alloc(occupancy)
-                    states = b.req_to_token_pool.mamba_allocator.alloc(count)
+                    states = b.token_to_kv_pool_allocator.state_slots.alloc(count)
                     outside = a.alloc(outside_count)
                     self.assertIsNotNone(slots)
                     self.assertIsNotNone(states)
@@ -157,7 +159,7 @@ class TestTriJointReclaim(CustomTestCase):
                 with self.subTest(lazy=lazy, locked=locked):
                     b, a, c = self.build(lazy=lazy)
                     slots = a.alloc(96)
-                    states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                    states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                     self.stamp(b, a, slots, states)
                     records = self.insert_parts(c, slots, states)
                     receipts = []
@@ -191,7 +193,7 @@ class TestTriJointReclaim(CustomTestCase):
 
     def test_state_phase_preserves_locked_token_bindings(self):
         b, a, c = self.build(temporal=(1, 4, 8))
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         slots = a.alloc(96)
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)
@@ -257,7 +259,7 @@ class TestTriJointReclaim(CustomTestCase):
         for occupancy in (0, 2):
             with self.subTest(cached_pages=occupancy):
                 b, a, c = self.build(page_size=4, state_cache=False)
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.assertIsNotNone(states)
                 slots = a.alloc(occupancy * 4)
                 self.assertIsNotNone(slots)
@@ -284,7 +286,7 @@ class TestTriJointReclaim(CustomTestCase):
                 seq = torch.tensor([396])
                 last = torch.tensor([-1])
                 with patch(
-                    "sglang.srt.mem_cache.allocator.unified_sub_pool.alloc_extend_kernel",
+                    "sglang.srt.mem_cache.kv.alloc.chain.alloc_extend_kernel",
                     CPUReferenceKernel(),
                 ):
                     got = alloc_paged_token_slots_extend(
@@ -300,7 +302,7 @@ class TestTriJointReclaim(CustomTestCase):
             with self.subTest(grouped=grouped):
                 b, a, c = self.build()
                 slots = a.alloc(96)
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
                 pending = a.alloc(2)
@@ -340,7 +342,7 @@ class TestTriJointReclaim(CustomTestCase):
     def test_session_cursor_joint_reclaim(self):
         b, a, c = self.build(sessions=True)
         slots = a.alloc(96)
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         self.stamp(b, a, slots, states)
         records = self.insert_parts(c, slots, states)
         evict_from_tree_cache(c, 4)
@@ -356,7 +358,7 @@ class TestTriJointReclaim(CustomTestCase):
         self.check_payload(b, a, slots[1:], states[1:], states)
         self.assertFalse(a.verify_byte_accounting())
 
-    def test_ready_allocation_preserves_payload_with_closed_move_gates(self):
+    def test_ready_allocation_preserves_payload_with_pinned_bands(self):
         for page_size, lazy, grouped in itertools.product(
             (1, 4), (False, True), (False, True)
         ):
@@ -377,7 +379,7 @@ class TestTriJointReclaim(CustomTestCase):
                     c.insert(InsertParams(key=key, value=slots))
                     records = [(key, slots.clone())]
                 for member in a._flush_targets():
-                    member.disagg_move_gate = lambda: False
+                    member.pin_sources = (lambda: True,)
                 if grouped:
                     a.free_group_begin()
                 self.assertGreaterEqual(a.available_size(), page_size)
@@ -403,7 +405,7 @@ class TestTriJointReclaim(CustomTestCase):
     def test_ready_and_no_progress_skip_repeated_preparation(self):
         b, a, c = self.build()
         slots = a.alloc(96)
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         self.stamp(b, a, slots, states)
         self.insert_parts(c, slots, states)
         with (
@@ -417,7 +419,7 @@ class TestTriJointReclaim(CustomTestCase):
         # Close every movement gate. The finite request quotas may still reclaim
         # cache bytes; actual allocation and each phase remain separately visible.
         for member in a._flush_targets():
-            member.disagg_move_gate = lambda: False
+            member.pin_sources = (lambda: True,)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
             patch.object(c, "evict_for_alloc", wraps=c.evict_for_alloc) as walks,
@@ -435,7 +437,7 @@ class TestTriJointReclaim(CustomTestCase):
 
         b, a, c = self.build()
         slots = a.alloc(96)
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         self.stamp(b, a, slots, states)
         records = self.insert_parts(c, slots, states)
         batch = object.__new__(ScheduleBatch)
@@ -537,7 +539,7 @@ class TestTriJointReclaim(CustomTestCase):
                     markers = slots.to(torch.float16).view(-1, 1, 1)
                     for layer in range(6):
                         member = full if layer < 4 else swa
-                        kernel_ids = member.translate_kv_loc(slots)
+                        kernel_ids = member.ids.translate(slots)
                         kv_pool.get_key_buffer(layer)[kernel_ids] = markers + 10 * layer
                         kv_pool.get_value_buffer(layer)[kernel_ids] = (
                             markers + 100 + 10 * layer
@@ -575,7 +577,7 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(allocator.alloc(6))
                     for layer in range(6):
                         member = full if layer < 4 else swa
-                        kernel_ids = member.translate_kv_loc(slots)
+                        kernel_ids = member.ids.translate(slots)
                         self.assertTrue(
                             torch.all(
                                 kv_pool.get_key_buffer(layer)[kernel_ids]
@@ -599,7 +601,7 @@ class TestTriJointReclaim(CustomTestCase):
         ):
             with self.subTest(lazy=lazy, demand=demand):
                 b, a, c = self.build(lazy=lazy, state_cache=False)
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 keys = [RadixKey(array("q", [i])) for i in range(96)]
@@ -627,7 +629,7 @@ class TestTriJointReclaim(CustomTestCase):
             with self.subTest(occupancy=occupancy, demand=demand):
                 group = 1
                 b, a, c = self.build(temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(occupancy)
                 self.stamp(b, a, slots, states)
                 records = []
@@ -698,7 +700,7 @@ class TestTriJointReclaim(CustomTestCase):
         for lazy in (False, True):
             with self.subTest(lazy=lazy):
                 b, a, c = self.build(lazy=lazy, temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
@@ -750,7 +752,7 @@ class TestTriJointReclaim(CustomTestCase):
                     patch.object(c, "evict_for_alloc", side_effect=checked_evict),
                     patch.object(sa, "make_room", side_effect=checked_move),
                     patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError(
                             "certified allocation used fallback"
                         ),
@@ -776,13 +778,11 @@ class TestTriJointReclaim(CustomTestCase):
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 self.assertFalse(a.verify_byte_accounting())
 
-    def test_float_plan_rechecks_gate_changes_during_preparation(self):
-        for owner, gate_attr in itertools.product(
-            ("full", "mamba", "swa"), ("disagg_move_gate", "host_transfer_move_gate")
-        ):
-            with self.subTest(owner=owner, gate=gate_attr):
+    def test_float_plan_rechecks_pins_taken_during_preparation(self):
+        for owner in ("full", "mamba", "swa"):
+            with self.subTest(owner=owner):
                 b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 self.insert_parts(c, slots, states)
@@ -800,7 +800,7 @@ class TestTriJointReclaim(CustomTestCase):
                 full_flush = a.full_attn_allocator.flush_for_allocation
 
                 def close_during_prepare():
-                    setattr(member, gate_attr, lambda: False)
+                    member.add_pin_source(lambda: True)
                     return full_flush()
 
                 sa = a.swa_attn_allocator
@@ -812,7 +812,7 @@ class TestTriJointReclaim(CustomTestCase):
                     ),
                     patch.object(sa, "make_room", wraps=sa.make_room) as movement,
                     patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError("stale plan used fallback"),
                     ),
                 ):
@@ -830,7 +830,7 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                     )
                 self.check_payload(b, a, slots[1:], states[1:], states)
-                setattr(member, gate_attr, None)
+                member.pin_sources = ()
                 self.assertTrue(a.ensure_capacity(4, 4))
                 self.assertIsNotNone(a.alloc(4))
                 self.check_payload(b, a, slots[1:], states[1:], states)
@@ -847,7 +847,7 @@ class TestTriJointReclaim(CustomTestCase):
                 fa, sa = a.full_attn_allocator, a.swa_attn_allocator
                 extra = fa.alloc(fa.available_size() - 2)
                 for layer in range(4):
-                    ids = fa.translate_kv_loc(extra)
+                    ids = fa.ids.translate(extra)
                     b.token_to_kv_pool.get_key_buffer(layer)[ids] = 701 + layer
                     b.token_to_kv_pool.get_value_buffer(layer)[ids] = 801 + layer
                 target = float_high_target(chain_snapshot(a), float_chain(a), 12)
@@ -863,7 +863,7 @@ class TestTriJointReclaim(CustomTestCase):
                         sa, "_relocate_to_positions", wraps=sa._relocate_to_positions
                     ) as whole,
                     patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError(
                             "positive certificate used fallback"
                         ),
@@ -881,7 +881,7 @@ class TestTriJointReclaim(CustomTestCase):
                     full_layers=4,
                 )
                 for layer in range(4):
-                    ids = fa.translate_kv_loc(extra)
+                    ids = fa.ids.translate(extra)
                     self.assertTrue(
                         torch.all(
                             b.token_to_kv_pool.get_key_buffer(layer)[ids] == 701 + layer
@@ -899,7 +899,7 @@ class TestTriJointReclaim(CustomTestCase):
         for full, swa in ((4, 0), (4, 2), (2, 4), (0, 4)):
             with self.subTest(full=full, swa=swa):
                 b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 self.insert_parts(c, slots, states)
@@ -927,11 +927,11 @@ class TestTriGeometry(CustomTestCase):
         for member, buf, ids, values in saved:
             self.assertTrue(
                 torch.all(
-                    member.virtual_to_physical[ids // member.page_size]
+                    member.ids.virtual_to_physical[ids // member.page_size]
                     >= member.min_page_index
                 )
             )
-            torch.testing.assert_close(buf[member.translate_kv_loc(ids)], values)
+            torch.testing.assert_close(buf[member.ids.translate(ids)], values)
         self.assertFalse(a.verify_byte_accounting())
 
     def test_float_fresh_destination_reservation_boundary(self):
@@ -944,7 +944,9 @@ class TestTriGeometry(CustomTestCase):
                         a.full_attn_allocator,
                         a.swa_attn_allocator,
                     )
-                    live = torch.where(ma.virtual_to_physical >= ma.min_page_index)[0]
+                    live = torch.where(ma.ids.virtual_to_physical >= ma.min_page_index)[
+                        0
+                    ]
                     live = live[live >= ma.min_page_index]
                     ma.free(live[:-1])
                     fa.flush_for_allocation()
@@ -983,7 +985,7 @@ class TestTriGeometry(CustomTestCase):
                             wraps=sa._relocate_to_positions,
                         ) as whole,
                         patch(
-                            "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                            "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                             side_effect=AssertionError(
                                 "positive certificate used fallback"
                             ),
@@ -1020,7 +1022,7 @@ class TestTriGeometry(CustomTestCase):
                 recognized.add(ps)
                 saved = payload(a, kv, mk)
                 with patch(
-                    "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                    "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                     side_effect=AssertionError("FLOAT certificate used fallback"),
                 ):
                     self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
@@ -1037,9 +1039,9 @@ class TestTriGeometry(CustomTestCase):
             ma = a.mamba_allocator
             extra = ma.alloc(ma.available_size())
             self.assertIsNotNone(extra)
-            vp = torch.where(ma.virtual_to_physical >= ma.min_page_index)[0]
+            vp = torch.where(ma.ids.virtual_to_physical >= ma.min_page_index)[0]
             vp = vp[vp >= ma.min_page_index]
-            mk.buf[ma.virtual_to_physical[vp]] = vp + 1000
+            mk.buf[ma.ids.virtual_to_physical[vp]] = vp + 1000
             ma.free(vp[1:-1:cut])
             if npage * ps <= a.available_size() or not float_end_certificate(
                 chain_snapshot(a), float_chain(a), npage * ps
@@ -1080,24 +1082,20 @@ class TestTriGeometry(CustomTestCase):
                 )
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = lambda: pd_open
-                    member.host_transfer_move_gate = lambda: host_open
+                    member.pin_sources = (lambda: not pd_open, lambda: not host_open)
                 before = snapshot(a)
                 self.assertFalse(
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
                 )
                 with patch.object(
-                    kv.swa_kv_pool,
-                    "move_physical_pages",
-                    wraps=kv.swa_kv_pool.move_physical_pages,
+                    a.arena, "move_units", wraps=a.arena.move_units
                 ) as copies:
                     self.assertFalse(a.ensure_capacity(5, 5))
                 self.assertEqual(copies.call_count, 0)
                 # Zero-copy FLOAT boundary absorption is legal even with movement gated.
                 self.check_saved(a, saved)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = None
-                    member.host_transfer_move_gate = None
+                    member.pin_sources = ()
                 self.assertTrue(a.ensure_capacity(5, 5))
                 self.assertIsNotNone(a.alloc(5))
                 self.check_saved(a, saved)
@@ -1123,7 +1121,7 @@ class TestTriGeometry(CustomTestCase):
                 stream = Stream()
                 fa.set_latest_forward_done_event(event)
                 fa.set_inflight_forward(event, None)
-                vp = torch.where(fa.virtual_to_physical >= fa.min_page_index)[0]
+                vp = torch.where(fa.ids.virtual_to_physical >= fa.min_page_index)[0]
                 vp = vp[vp >= fa.min_page_index][10:11]
                 tokens = (vp[:, None] * ps + torch.arange(ps)[None, :]).flatten()
                 a.free(tokens)
@@ -1131,7 +1129,7 @@ class TestTriGeometry(CustomTestCase):
                 self.assertGreater(len(fa._pending_reuse_pages_cpu), 0)
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = lambda: False
+                    member.pin_sources = (lambda: True,)
                 before = snapshot(a)
                 predictions = [
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), n * ps)
@@ -1149,7 +1147,7 @@ class TestTriGeometry(CustomTestCase):
                     )
                 self.assertEqual(snapshot(a), before)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = None
+                    member.pin_sources = ()
                 if not urgent:
                     event.fired = True
                     fa.set_latest_forward_done_event(None)

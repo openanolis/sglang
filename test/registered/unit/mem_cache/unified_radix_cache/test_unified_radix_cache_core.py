@@ -25,10 +25,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     RecoverSWAWithLockedFull,
@@ -872,7 +874,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNotNone(swa_value)
         self.assertTrue(
             torch.equal(
-                allocator.translate_loc_from_full_to_swa(old_full_value),
+                allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(old_full_value),
                 swa_value,
             )
         )
@@ -2217,7 +2219,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         tokens = list(range(1, seq_len + 1))
         req.origin_input_ids = tokens
         req.output_ids = []
@@ -2270,7 +2272,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
                 temperature=0, max_new_tokens=owned - prompt_len
             ),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
         req.extend_end = prompt_len
