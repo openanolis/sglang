@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tri-pool composite (`UnifiedMambaSWATokenToKVPoolAllocator`) -- full KV +
+"""Tri-pool chain (`ChainAllocator` over full, swa and mamba) -- full KV +
 SWA KV + mamba/conv state in ONE unified byte buffer, chain
 ``[mamba (up END) | swa (FLOAT) | full (down END)]``.
 
@@ -27,14 +27,13 @@ import torch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_mamba_slots,
 )
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
     MultiEndedAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -45,13 +44,15 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMambaSlotAllocator,
-    init_unified_mamba_swa_pools,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
+    build_test_unified_pools,
+    chain_snapshot,
+    float_chain,
     tri_sub_pool_specs,
 )
 
@@ -86,10 +87,11 @@ class TestUnifiedTriPool(unittest.TestCase):
         )
         kvcache = FakeUnifiedSWAKVPool(pool)
         mamba_kv = FakeKVCache(pool.max_slots("mamba"))
-        allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            mamba_kvcache=mamba_kv,
+            state_kvcache=mamba_kv,
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -462,10 +464,11 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         )
         kvcache = FakeUnifiedSWAKVPool(pool)
         mamba_kv = FakeKVCache(pool.max_slots("mamba"))
-        allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            mamba_kvcache=mamba_kv,
+            state_kvcache=mamba_kv,
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -764,12 +767,12 @@ class TestComputedShortSide(unittest.TestCase):
         )
         # Synthetic coupling: the state end joins the demand vector, the
         # override a composite with ends on both sides would ship.
-        need = lambda self, t: {
-            fa: -(-t // self.page_size),
-            sa: -(-t // self.page_size),
-            ma: -(-t // self.page_size),
+        need = lambda self, c, t: {
+            fa: -(-t // c.page_size),
+            sa: -(-t // c.page_size),
+            ma: -(-t // c.page_size),
         }
-        with mock.patch.object(type(alloc), "_alloc_demand", need):
+        with mock.patch.object(type(alloc._policy), "_alloc_demand", need):
             # (a) both sides short: absurd need -> both demands exceed their
             # bands -> make_room must NOT be called.
             with mock.patch.object(
@@ -802,7 +805,7 @@ class TestComputedShortSide(unittest.TestCase):
 
         alloc = self._tri()
         alloc.alloc(4 * self.PS)
-        demand = alloc._alloc_demand(2 * self.PS)
+        demand = alloc._policy._alloc_demand(alloc, 2 * self.PS)
         self.assertEqual(demand[alloc.mamba_allocator], 0)
         sa = alloc.swa_attn_allocator
         with mock.patch.object(
@@ -1009,7 +1012,7 @@ class TestTriFactorySizing(unittest.TestCase):
                         lazy_compaction=lazy_compaction,
                     )
                     with get_parallel().override(attn_dcp_size=1):
-                        pool = init_unified_mamba_swa_pools(**kw).req_to_token_pool
+                        pool = build_test_unified_pools(**kw).req_to_token_pool
                     if lazy_compaction is None:
                         pool = SimpleNamespace(
                             mamba_allocator=MambaSlotAllocator(16, "cpu")
@@ -1092,6 +1095,11 @@ class TestTriFactorySizing(unittest.TestCase):
                                     configurator
                                 )
                             ),
+                            _unified_window_and_state=lambda: (tri_pool, True),
+                            _kv_layer_decls=lambda: (
+                                cfg.KVCacheConfigurator._kv_layer_decls(configurator)
+                            ),
+                            post_capture_kv_active=False,
                         )
                         # Run the production configurator AND factory. Reverting
                         # either top-level flag forwarding must break cleanup.
@@ -1135,21 +1143,17 @@ class TestTriFactorySizing(unittest.TestCase):
                                 cfg, "_should_enable_lazy_compaction", return_value=True
                             ),
                         ):
-                            if tri_pool:
-                                bundle = cfg.KVCacheConfigurator._init_unified_mamba_swa_pools(
-                                    configurator,
-                                    max_num_reqs=4,
+                            bundle = cfg.KVCacheConfigurator._init_unified_pools(
+                                configurator,
+                                sizes=SimpleNamespace(
+                                    max_running_requests=4,
+                                    max_total_num_tokens=64,
                                     full_max_total_num_tokens=64,
                                     swa_max_total_num_tokens=32,
-                                )
-                            else:
-                                bundle = (
-                                    cfg.KVCacheConfigurator._init_unified_mamba_pools(
-                                        configurator,
-                                        max_num_reqs=4,
-                                        max_total_num_tokens=64,
-                                    )
-                                )
+                                    unified_total_bytes=None,
+                                    unified_memory_pool_bytes=None,
+                                ),
+                            )
                             pool = bundle.req_to_token_pool
                         self.assertEqual(pool.enable_mamba_extra_buffer_lazy, lazy)
                         allocator = pool.mamba_allocator
@@ -1208,7 +1212,7 @@ class TestTriFactorySizing(unittest.TestCase):
                     max_mamba_cache_size=16,
                 )
                 with get_parallel().override(attn_dcp_size=1):
-                    pool = init_unified_mamba_swa_pools(**kw).req_to_token_pool
+                    pool = build_test_unified_pools(**kw).req_to_token_pool
                 mapping = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
                 allocator = pool.mamba_allocator
                 reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
@@ -1237,19 +1241,18 @@ class TestTriFactorySizing(unittest.TestCase):
                 self.assertEqual(gathered.tolist(), item_reads)
 
     def test_budget_sizing_and_boot_signature(self):
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWAAllocatorBase,
-            UnifiedSWATokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 
         budget = 1 << 20
-        bundle = init_unified_mamba_swa_pools(
+        bundle = build_test_unified_pools(
             **self._factory_kwargs(unified_total_bytes=budget)
         )
         pool = bundle.unified_memory_pool
         allocator = bundle.token_to_kv_pool_allocator
-        self.assertIsInstance(allocator, UnifiedSWAAllocatorBase)
-        self.assertNotIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+        self.assertIsInstance(allocator, ChainAllocator)
+        self.assertEqual(
+            [m.sub_pool_name for m in allocator.members], ["full", "swa", "mamba"]
+        )
         # Buffer = budget + the state pool's bytes (budget captured AFTER the
         # state carve-out), never the token-count re-sum.
         state_bytes = 4 * pool.spec("mamba").entry_bytes()
@@ -1262,7 +1265,7 @@ class TestTriFactorySizing(unittest.TestCase):
         )
 
     def test_fallback_is_the_token_count_resum(self):
-        bundle = init_unified_mamba_swa_pools(**self._factory_kwargs())
+        bundle = build_test_unified_pools(**self._factory_kwargs())
         pool = bundle.unified_memory_pool
         want = (
             64 * pool.spec("full").entry_bytes()
@@ -1281,9 +1284,7 @@ class TestTriFactorySizing(unittest.TestCase):
         placement = FusedDraftPlacement.from_counts(
             counts={"full": [1]}, regions={"full": region}
         )
-        bundle = init_unified_mamba_swa_pools(
-            **self._factory_kwargs(fused_draft=placement)
-        )
+        bundle = build_test_unified_pools(**self._factory_kwargs(fused_draft=placement))
         pool = bundle.unified_memory_pool
         self.assertIs(pool.fused_draft, placement)
         self.assertIs(pool.spec("full").draft_region, region)
@@ -1309,7 +1310,7 @@ class TestTriFactorySizing(unittest.TestCase):
         """A draft runner's req pool over the fused state block keeps the
         target's request->slot mappings and slot allocator (the draft's slot
         ids ARE the target's), and views only its own block."""
-        bundle = init_unified_mamba_swa_pools(
+        bundle = build_test_unified_pools(
             **self._factory_kwargs(fused_draft=self._state_placement())
         )
         target = bundle.req_to_token_pool
@@ -1330,7 +1331,7 @@ class TestTriFactorySizing(unittest.TestCase):
         """A budget far below one worst-case request must raise BEFORE any
         pool construction -- under-sizing is a retract LIVELOCK at runtime."""
         with self.assertRaisesRegex(RuntimeError, "bs=1 floor"):
-            init_unified_mamba_swa_pools(
+            build_test_unified_pools(
                 **self._factory_kwargs(
                     unified_total_bytes=1024,  # << ctx * e_f alone
                     model_context_len=100_000,
@@ -1464,10 +1465,11 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
             page_size=page_size,
         )
         kvcache = FakeUnifiedSWAKVPool(pool)
-        return pool, UnifiedMambaSWATokenToKVPoolAllocator(
+        return pool, ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            mamba_kvcache=FakeKVCache(pool.max_slots("mamba")),
+            state_kvcache=FakeKVCache(pool.max_slots("mamba")),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -1578,10 +1580,11 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
             enable_memory_saver=False,
         )
         kvcache = FakeUnifiedSWAKVPool(pool)
-        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+        alloc = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            mamba_kvcache=FakeKVCache(pool.max_slots("mamba")),
+            state_kvcache=FakeKVCache(pool.max_slots("mamba")),
             device=_DEV,
             full_max_total_num_tokens=48,
             swa_max_total_num_tokens=32,
@@ -1670,10 +1673,11 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
         )
-        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+        alloc = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=FakeUnifiedSWAKVPool(pool),
-            mamba_kvcache=FakeKVCache(pool.max_slots("mamba")),
+            state_kvcache=FakeKVCache(pool.max_slots("mamba")),
             device=_DEV,
             full_max_total_num_tokens=48,
             swa_max_total_num_tokens=32,
@@ -1733,7 +1737,9 @@ class TestPreallocIsPricedOnTheSharedGrid(unittest.TestCase):
         self.assertLessEqual(swa_demand, allocator.swa_available_size())
         # ... yet the two draw on the same bytes, so the grid refuses the pair.
         self.assertFalse(
-            allocator._fits_page_demand(
+            float_fit(
+                chain_snapshot(allocator),
+                float_chain(allocator),
                 -(-full_demand // allocator.page_size),
                 -(-swa_demand // allocator.page_size),
             )

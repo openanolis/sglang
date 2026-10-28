@@ -13,9 +13,8 @@ import torch
 
 from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_WINDOW,
@@ -27,7 +26,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedSWAKVPool,
 )
@@ -97,7 +95,8 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
         )
-        allocator = UnifiedSWATokenToKVPoolAllocator(
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=buffer,
             kvcache=target_pool,
             device="cuda",

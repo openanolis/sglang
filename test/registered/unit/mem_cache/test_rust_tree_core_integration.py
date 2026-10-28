@@ -2370,20 +2370,18 @@ def _swa_transfer_core(
     has_swa_host_pool=True,
 ):
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-        UnifiedSWAAllocatorBase,
-    )
+    from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
     from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
-    allocator = Mock(
-        spec=UnifiedSWAAllocatorBase if unified else SWATokenToKVPoolAllocator
-    )
+    allocator = Mock(spec=ChainAllocator if unified else SWATokenToKVPoolAllocator)
     allocator.device = torch.device("cpu")
     allocator.swa_req_ring = False
+    allocator.hands_out_virtual_ids = unified
+    allocator.has_window_pool = True
     params = CacheInitParams(
         disable=False,
         req_to_token_pool=Mock(spec=HybridReqToTokenPool) if mamba else None,
@@ -4859,9 +4857,9 @@ def test_write_through_threshold_assignment_reaches_the_core():
 
 @pytest.mark.parametrize("backup_nodes", ["leaf", "parent_and_leaf", "parent"])
 def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
-    from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+    from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,

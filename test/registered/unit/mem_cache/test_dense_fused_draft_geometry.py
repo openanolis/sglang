@@ -18,6 +18,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -32,9 +35,6 @@ from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftSWAKVPool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    MLASubPoolSpec,
     UnifiedKVPool,
     UnifiedMambaPool,
     UnifiedMHATokenToKVPool,
@@ -511,9 +511,7 @@ class TestFusedMLAHost(unittest.TestCase):
         """A draft runner bound over the MLA host's entries translates through
         the mamba allocator's full-side v2p, as on the SWA host; a passthrough
         here would write raw virtual ids into the views."""
-        from sglang.srt.mem_cache.allocator.unified_mamba import (
-            UnifiedMambaTokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
         from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 
         pool = self._pool()
@@ -523,7 +521,9 @@ class TestFusedMLAHost(unittest.TestCase):
                 self.allocator = allocator
 
         kvcache = SimpleNamespace(full_kv_pool=_FakeKV(), mamba_pool=_FakeKV())
-        alloc = UnifiedMambaTokenToKVPoolAllocator(
+        alloc = ChainAllocator(
+            roles=ChainRoles(owner="full", state="mamba"),
+            state_kvcache=kvcache.mamba_pool,
             unified_buffer=pool,
             kvcache=kvcache,
             device=_DEV,

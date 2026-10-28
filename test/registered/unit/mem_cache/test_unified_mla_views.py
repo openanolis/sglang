@@ -30,15 +30,13 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MLASubPoolSpec,
     UnifiedKVPool,
     UnifiedMLATokenToKVPool,
 )
@@ -411,8 +409,13 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
         with get_parallel().override(
             dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
         ):
-            allocator = UnifiedMambaTokenToKVPoolAllocator(
-                unified_buffer=pool, kvcache=kvcache, device=_DEV, page_size=ps
+            allocator = ChainAllocator(
+                roles=ChainRoles(owner="full", state="mamba"),
+                state_kvcache=kvcache.mamba_pool,
+                unified_buffer=pool,
+                kvcache=kvcache,
+                device=_DEV,
+                page_size=ps,
             )
         return allocator, kvcache
 
