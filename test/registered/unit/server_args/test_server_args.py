@@ -5074,6 +5074,72 @@ class TestLaunchCommand(CustomTestCase):
         )
 
 
+class TestAccessKeyRedaction(CustomTestCase):
+    """The access keys and the TLS key password reach nothing that reports the
+    configuration: not the launch command, `/server_info`, the startup log or
+    the record's repr. Anyone holding the API key can read those, and the
+    admin key must stay out of their reach."""
+
+    # Spellings argparse accepts: an abbreviation with `=`, a value with a
+    # space, a value that spells another key flag, and a repeated flag.
+    ARGV = [
+        "--model-path",
+        "/tmp/x",
+        "--api-key",
+        "alpha beta",
+        "--admin-api-ke=alpha-admin",
+        "--api-key=--admin-api-key=x",
+        "--admin-api-key",
+        "second-admin",
+        "--ssl-keyfile-password",
+        "tls-secret",
+    ]
+    SECRETS = (
+        "alpha beta",
+        "alpha-admin",
+        "--admin-api-key=x",
+        "second-admin",
+        "tls-secret",
+    )
+
+    def _assert_no_secret(self, text: str):
+        for secret in self.SECRETS:
+            self.assertNotIn(secret, text)
+
+    def test_launch_command_redacts_every_spelling(self):
+        server_args = prepare_server_args(self.ARGV)
+        self.assertEqual(
+            server_args.launch_command,
+            "--model-path /tmp/x --api-key <redacted> --admin-api-ke=<redacted> "
+            "--api-key=<redacted> --admin-api-key <redacted> "
+            "--ssl-keyfile-password <redacted>",
+        )
+        # Redaction is for display only: the server still authenticates with
+        # the values the operator gave, the last of each repeated flag.
+        self.assertEqual(server_args.api_key, "--admin-api-key=x")
+        self.assertEqual(server_args.admin_api_key, "second-admin")
+
+    def test_server_info_reports_whether_a_key_is_set_not_its_value(self):
+        from sglang.srt.entrypoints.server_utils import build_server_info
+
+        info = build_server_info(prepare_server_args(self.ARGV), {})
+        self.assertEqual(info["api_key"], "<redacted>")
+        self.assertEqual(info["admin_api_key"], "<redacted>")
+        self.assertEqual(info["ssl_keyfile_password"], "<redacted>")
+        self._assert_no_secret(json.dumps(info, default=str))
+        unset = build_server_info(prepare_server_args(["--model-path", "/tmp/x"]), {})
+        self.assertIsNone(unset["api_key"])
+        self.assertIsNone(unset["admin_api_key"])
+        self.assertIsNone(unset["ssl_keyfile_password"])
+
+    def test_startup_log_and_repr(self):
+        from sglang.srt.entrypoints.engine import _server_args_for_logging
+
+        server_args = prepare_server_args(self.ARGV)
+        self._assert_no_secret(str(_server_args_for_logging(server_args)))
+        self._assert_no_secret(repr(server_args))
+
+
 class TestNoneMeansUnset(CustomTestCase):
     """A valued field the resolution rewrites carries `None` for "not set".
 
@@ -5480,6 +5546,13 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
             "--tokenizer-metrics-allowed-custom-labels",
             "tenant",
         ],
+        "enable_http2": ["--enable-http2"],
+        "mm_preprocess_cache_size_mb": ["--mm-preprocess-cache-size-mb", "512"],
+        "language_only": ["--language-only"],
+        "checkpoint_engine_wait_weights_before_ready": [
+            "--checkpoint-engine-wait-weights-before-ready"
+        ],
+        "delete_ckpt_after_loading": ["--delete-ckpt-after-loading"],
         "return_input_ids": ["--return-input-ids"],
         "return_output_ids": ["--return-output-ids"],
     }
@@ -5511,6 +5584,31 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         for cli_args in self.REFUSED.values():
             self.assertIn(cli_args[0], message)
 
+    def test_tool_strict_level_is_refused(self):
+        with envs.SGLANG_TOOL_STRICT_LEVEL.override(2):
+            with self.assertRaisesRegex(
+                ValueError, "does not support SGLANG_TOOL_STRICT_LEVEL:"
+            ):
+                self._resolve([])
+            self._resolve([], rust_server=False)
+
+    def test_args_a_model_package_honors_are_not_refused(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--mm-preprocess-cache-size-mb",
+                "512",
+                "--enable-http2",
+            ]
+        )
+        self.assertEqual(
+            validation_hook.rust_server_unsupported_args(
+                args, honored={"mm_preprocess_cache_size_mb"}
+            ),
+            ["--enable-http2"],
+        )
+
     def test_supported_and_default_valued_args_pass(self):
         self._resolve(
             [
@@ -5521,7 +5619,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "--crash-dump-folder",
                 "/tmp/dumps",
                 "--trust-remote-code",
-                "--enable-http2",
                 "--enable-request-time-stats-logging",
                 "--skip-server-warmup",
                 # Honored by the Rust server.
@@ -5542,6 +5639,9 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 # Python disables the GC warning when this is not positive.
                 "--gc-warning-threshold-secs",
                 "-1",
+                # The preprocessing cache off, as in the Rust pipelines.
+                "--mm-preprocess-cache-size-mb",
+                "0",
             ]
         )
 
