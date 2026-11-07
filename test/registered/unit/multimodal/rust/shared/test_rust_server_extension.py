@@ -15,6 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
@@ -704,6 +705,7 @@ class TestRustServerExtension(CustomTestCase):
             model_config=SimpleNamespace(
                 is_multimodal=True, hf_config=sentinel.config, model_path="test/model"
             ),
+            server_args=sentinel.server_args,
         )
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
@@ -713,7 +715,11 @@ class TestRustServerExtension(CustomTestCase):
             extension=extension,
             health_generate_headers={},
             default_max_new_tokens=128,
+            request_class=GenerateReqInput,
+            server_added_custom_params=(),
         )
+        # What a crash dump carries.
+        self.assertIs(instance.server_args, sentinel.server_args)
         extension.Server.assert_called_once_with(
             sentinel.args,
             cores=None,
@@ -1277,6 +1283,7 @@ class TestRustServerExtension(CustomTestCase):
                     hf_config=sentinel.config,
                     model_path="test/model",
                 ),
+                server_args=sentinel.server_args,
             )
             with launch_context(ModelServer, cores=([launch_core], server_cores)):
                 ModelServer.launch(scheduler)
