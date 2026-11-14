@@ -1076,8 +1076,11 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
     let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected FreeDeviceKVFullOnly then SwaRebuild");
     };
-    let FreeDeviceKVFullOnly { indices: freed } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: freed,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -1239,15 +1242,20 @@ fn insert_overlap_straddling_the_boundary_splits_and_recovers_the_tail() {
             action_kinds(&result.cache_actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
     } = expect_action::<SwaRebuild>(action1.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
+    assert!(!*tree_owned);
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -1291,7 +1299,9 @@ fn insert_overlap_straddling_with_a_locked_full_defers_the_tail() {
     } = expect_action::<RecoverSwaWithLockedFull>(action0.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(!*tree_owned);
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[12i64, 13])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -1312,8 +1322,11 @@ fn insert_overlap_entirely_outside_the_window_is_all_duplicate() {
     let [action] = result.cache_actions.as_slice() else {
         panic!("expected one FreeDeviceKVFullOnly action");
     };
-    let FreeDeviceKVFullOnly { indices: freed } =
-        expect_action::<FreeDeviceKVFullOnly>(action.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: freed,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action.as_ref());
+    assert!(!*tree_owned);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
 
@@ -1371,9 +1384,14 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
-    let FreeDeviceKVFullOnly { indices: old_full } =
-        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(!*tree_owned);
+    let FreeDeviceKVFullOnly {
+        indices: old_full,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -1427,16 +1445,23 @@ fn insert_overlap_straddling_a_second_level_node_recovers_the_tail() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates_head,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(!*tree_owned);
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
     } = expect_action::<SwaRebuild>(action2.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates_tail,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action3.as_ref());
+    assert!(!*tree_owned);
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert!(old_tail[0].equal(&Tensor::from_slice(&[14i64])));
     assert_eq!(*node_id, tc.arena.node(b).id);
@@ -1483,7 +1508,9 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates_head,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(!*tree_owned);
     let RecoverSwaWithLockedFull {
         node_id,
         kept_full,
@@ -1491,7 +1518,9 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
     } = expect_action::<RecoverSwaWithLockedFull>(action1.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates_tail,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
+    assert!(!*tree_owned);
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert_eq!(*node_id, tc.arena.node(b).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[14i64])));
@@ -1539,8 +1568,11 @@ fn insert_overlap_prev_prefix_strictly_inside_the_node_recovers_only_beyond_it()
             action_kinds(&result.cache_actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -1867,7 +1899,9 @@ fn reinsert_boundary_at_the_node_start_rebuilds_the_whole_node() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(!*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -4441,15 +4475,20 @@ fn insert_overlap_straddling_with_a_partial_prev_prefix_recovers_the_tail() {
             action_kinds(&result.cache_actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
     } = expect_action::<SwaRebuild>(action1.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
+    assert!(!*tree_owned);
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -6409,8 +6448,11 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
             action_kinds(&step.actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_full } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_full,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -6883,5 +6925,221 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
             result.swa_branch_inserted, expected,
             "swa_branching_seqlen={branching_seqlen:?}"
         );
+    }
+}
+
+// joint_lru keeps device SWA ticks by arena slot: a node that loses only its SWA
+// keeps no tick, and a node allocated into a freed slot starts without one.
+#[test]
+fn joint_lru_swa_ticks_leave_with_the_device_swa_and_the_freed_slot() {
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            joint_lru: true,
+            ..swa_params_with_window(4)
+        },
+        vec![FULL, SWA],
+    );
+    for (key, value) in [
+        (vec![1, 2], vec![10, 11]),
+        (vec![1, 2, 3, 4], vec![10, 11, 12, 13]),
+        (vec![1, 2, 5, 6], vec![10, 11, 14, 15]),
+    ] {
+        tc.insert(&insert_params_swa(
+            &key, &value, /* prev_prefix_len = */ 0, /* swa_evicted_seqlen = */ 0,
+        ));
+    }
+    let parent = child_of(&tc, tc.arena.root(), &[1]);
+    let leaf = child_of(&tc, parent, &[3]);
+    let sibling = child_of(&tc, parent, &[5]);
+    for node in [parent, leaf, sibling] {
+        store_swa_device(&mut tc, node);
+    }
+    let tick = |tc: &UnifiedTreeCore<Vec<i64>>, node| tc.joint_lru.as_ref().unwrap().swa_tick(node);
+    assert!(tick(&tc, parent).is_some());
+    assert!(tick(&tc, leaf).is_some());
+
+    // An SWA-only eviction keeps the node and its Full.
+    let (mut df, mut hf) = (HashMap::new(), HashMap::new());
+    tc.evict_component_and_detach_lru_(
+        parent,
+        SWA,
+        &mut df,
+        &mut hf,
+        &mut Vec::new(),
+        EvictLayer::Device,
+        /* tracker = */ None,
+    );
+    assert!(tc.arena.has_device_value(parent, FULL));
+    assert!(!tc.arena.has_device_value(parent, SWA));
+    assert_eq!(tick(&tc, parent), None);
+
+    // Deleting the leaf frees its slot for the next node.
+    tc.evict_device_leaf(tc.arena.node(leaf).id, /* is_write_back = */ false)
+        .unwrap();
+    let reused = tc
+        .arena
+        .alloc_child(
+            parent,
+            /* key = */ vec![7],
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap();
+    assert_eq!(reused, leaf);
+    assert_eq!(tick(&tc, reused), None);
+}
+
+// A match that splits a node does not access the suffix: under joint_lru the
+// suffix keeps its Full access counter, while other policies stamp it.
+#[test]
+fn joint_lru_prefix_match_keeps_the_split_suffix_full_access() {
+    for joint_lru in [true, false] {
+        let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+            CacheInitParams {
+                joint_lru,
+                ..swa_params_with_window(4)
+            },
+            vec![FULL, SWA],
+        );
+        tc.insert(&insert_params_swa(
+            &vec![1, 2, 3, 4],
+            &[10, 11, 12, 13],
+            /* prev_prefix_len = */ 0,
+            /* swa_evicted_seqlen = */ 0,
+        ));
+        let node = child_of(&tc, tc.arena.root(), &[1]);
+        let before = tc.arena.node(node).last_access_counter;
+        tc.match_prefix(&match_params(&vec![1, 2]));
+        // The split keeps the original slot for the suffix.
+        assert_eq!(tc.arena.node(node).key, vec![3, 4]);
+        let after = tc.arena.node(node).last_access_counter;
+        if joint_lru {
+            assert_eq!(after, before);
+        } else {
+            assert!(after > before);
+        }
+    }
+}
+
+// An insert that splits a node does not access the suffix: under joint_lru the
+// suffix keeps its Full access counter, while other policies stamp it.
+#[test]
+fn joint_lru_prefix_insert_keeps_the_split_suffix_full_access() {
+    for joint_lru in [true, false] {
+        for host in [false, true] {
+            let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+                CacheInitParams {
+                    joint_lru,
+                    ..swa_params_with_window(4)
+                },
+                vec![FULL, SWA],
+            );
+            tc.insert(&insert_params_swa(
+                &vec![1, 2, 3, 4],
+                &[10, 11, 12, 13],
+                /* prev_prefix_len = */ 0,
+                /* swa_evicted_seqlen = */ 0,
+            ));
+            let node = child_of(&tc, tc.arena.root(), &[1]);
+            let before = tc.arena.node(node).last_access_counter;
+            if host {
+                let root_id = tc.arena.node(tc.arena.root()).id;
+                tc.insert_host(
+                    root_id,
+                    /* extra_key = */ None,
+                    vec![1, 2, 9],
+                    Tensor::from_slice(&[100i64, 101, 102]),
+                    (0..3).map(|i| format!("h{i}")).collect(),
+                )
+                .unwrap();
+            } else {
+                tc.insert(&insert_params_swa(
+                    &vec![1, 2, 9],
+                    &[20, 21, 22],
+                    /* prev_prefix_len = */ 0,
+                    /* swa_evicted_seqlen = */ 0,
+                ));
+            }
+            // The split keeps the original slot for the suffix.
+            assert_eq!(tc.arena.node(node).key, vec![3, 4]);
+            let after = tc.arena.node(node).last_access_counter;
+            if joint_lru {
+                assert_eq!(after, before, "host={host}");
+            } else {
+                assert!(after > before, "host={host}");
+            }
+        }
+    }
+}
+
+// A joint walk that finishes a pending SWA backup on a Full leaf strips only its
+// SWA value, whether or not the backup completed.
+#[test]
+fn joint_lru_pending_swa_backup_on_a_full_leaf_strips_only_swa() {
+    for acked in [false, true] {
+        let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+            CacheInitParams {
+                eviction_policy: "joint_lru".to_owned(),
+                joint_lru: true,
+                swa_sliding_window_size: Some(2),
+                page_size: 1,
+                enable_hicache: true,
+                has_swa_host_pool: true,
+                is_write_back: true,
+                ..Default::default()
+            },
+            vec![FULL, SWA],
+        );
+        let key = vec![1];
+        let node_id = tc
+            .insert(&insert_params_swa(
+                &key,
+                &[10],
+                /* prev_prefix_len = */ 0,
+                /* swa_evicted_seqlen = */ 0,
+            ))
+            .last_device_node_id
+            .unwrap();
+        let idx = tc.arena.resolve(node_id).unwrap();
+        store_swa_device(&mut tc, idx);
+        tc.match_prefix(&match_params(&key));
+        assert!(tc.evictable_device_leaves.contains(idx));
+        assert!(
+            tc.joint_lru.as_ref().unwrap().swa_tick(idx).unwrap()
+                < tc.arena.node(idx).last_access_counter
+        );
+
+        tc.start_joint_eviction();
+        assert!(tc.component_state(SWA).evict_device_strip_only);
+        assert_eq!(tc.next_joint_eviction_victim(), Some((SWA, node_id)));
+        request_internal_swa_backup(&mut tc, node_id, /* needed = */ 1);
+        if acked {
+            commit_internal_swa_backup(&mut tc, node_id);
+        }
+        let step = tc.finish_swa_state_eviction(node_id);
+        assert_eq!(step.tracker, HashMap::from([(SWA, 1)]), "acked={acked}");
+        assert_eq!(step.device_frees.len(), 1, "acked={acked}");
+        assert!(step.device_frees[&SWA][0].equal(&Tensor::from_slice(&[10i64])));
+        assert!(step.host_frees.is_empty());
+        assert!(
+            tc.arena
+                .node(idx)
+                .device_value(FULL)
+                .equal(&Tensor::from_slice(&[10i64]))
+        );
+        assert!(!tc.arena.has_device_value(idx, SWA));
+        assert!(!tc.device_lru_list(SWA).in_list(Some(idx)));
+        assert_eq!(tc.joint_lru.as_ref().unwrap().swa_tick(idx), None);
+        assert_eq!(tc.arena.node(idx).has_host_value(FULL), acked);
+        assert_eq!(tc.arena.node(idx).has_host_value(SWA), acked);
+        assert_eq!(tc.component_state(SWA).evict_device_pending_node, None);
+        assert_eq!(tc.component_state(SWA).evict_device_pending_num_tokens, 0);
+        // The Full leaf stays for the walk's Full side.
+        assert_eq!(tc.next_joint_eviction_victim(), Some((FULL, node_id)));
+        assert_eq!(tc.next_joint_eviction_victim(), None);
+        tc.end_joint_eviction();
+        assert!(!tc.component_state(SWA).evict_device_strip_only);
+        assert!(!tc.component_state(SWA).is_evict_device_ongoing);
+        tc.sanity_check(&[], &[]);
     }
 }
